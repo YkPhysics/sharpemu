@@ -212,4 +212,32 @@ public static class AudioOut2Exports
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
+
+    [SysAbiExport(
+        Nid = "8XTArSPyWHk",
+        ExportName = "sceAudioOut2PortSetAttributes",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2PortSetAttributes(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "PE2zHMqLSHs",
+        ExportName = "sceAudioOut2ContextAdvance",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextAdvance(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "aII9h5nli9U",
+        ExportName = "sceAudioOut2ContextPush",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextPush(CpuContext ctx)
+    {
+        // One 512-frame buffer at 48 kHz is about 10.7 ms. The real service
+        // naturally back-pressures this call; without that pacing the guest
+        // audio worker consumes an entire core and starves map/render workers.
+        Thread.Sleep(10);
+        return ctx.SetReturn(0);
+    }
 }

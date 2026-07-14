@@ -464,6 +464,48 @@ public static class VideoOutExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // SceVideoOutVblankStatus: count, processTime, tsc, flags/reserved.  Unreal's
+    // PS5 RHI uses this query to decide whether its flip thread may advance.  An
+    // unresolved-import error leaves that thread permanently waiting after the
+    // bootstrap flip.
+    [SysAbiExport(
+        Nid = "1FZBKy8HeNU",
+        ExportName = "sceVideoOutGetVblankStatus",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetVblankStatus(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var statusAddress = ctx[CpuRegister.Rsi];
+        if (statusAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        ulong count;
+        lock (_stateGate)
+        {
+            count = ++port.VblankCount;
+        }
+
+        var timestamp = unchecked((ulong)Stopwatch.GetTimestamp());
+        var processTime = unchecked((ulong)(Stopwatch.GetElapsedTime(0, (long)timestamp).TotalMicroseconds));
+        if (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count) ||
+            !KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, processTime) ||
+            !KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, timestamp) ||
+            !KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, 0))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "zgXifHT9ErY",
         ExportName = "sceVideoOutIsFlipPending",

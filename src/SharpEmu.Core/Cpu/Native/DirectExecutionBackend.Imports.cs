@@ -17,6 +17,8 @@ public sealed partial class DirectExecutionBackend
 {
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
+	private long _primaryImportDispatchCount;
+	private long _nextPrimaryStallSample = 5_000_000;
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
@@ -110,6 +112,57 @@ public sealed partial class DirectExecutionBackend
 		{
 			LastError = "Import dispatch called without active CPU context";
 			return 18446744071562199298uL;
+		}
+		// The primary guest can remain runnable indefinitely while polling through
+		// leaf pthread/TLS imports. Service the cooperative worker scheduler at a
+		// bounded cadence so expired timed waits (notably RHIFrameFlipThread) are
+		// resumed even when the primary thread never enters a blocking HLE call.
+		var primaryImportDispatchCount = !GuestThreadExecution.IsGuestThread
+			? Interlocked.Increment(ref _primaryImportDispatchCount)
+			: 0;
+		if (primaryImportDispatchCount != 0 && (primaryImportDispatchCount & 0xFF) == 0)
+		{
+			Pump(cpuContext, "import_tick");
+		}
+		if (primaryImportDispatchCount != 0 &&
+			(primaryImportDispatchCount & 0xFFF) == 0)
+		{
+		}
+		var nextPrimaryStallSample = Volatile.Read(ref _nextPrimaryStallSample);
+		if (!GuestThreadExecution.IsGuestThread &&
+			num >= nextPrimaryStallSample &&
+			string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_STALL_FRAMES"), "1", StringComparison.Ordinal) &&
+			Interlocked.CompareExchange(
+				ref _nextPrimaryStallSample,
+				nextPrimaryStallSample + 5_000_000,
+				nextPrimaryStallSample) == nextPrimaryStallSample)
+		{
+			Console.Error.WriteLine($"[LOADER][TRACE] Primary guest stack sample at import#{num}");
+			TraceImportFrameChain(cpuContext, num);
+			foreach (var thread in SnapshotThreads())
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] GuestThreadSample#{num}: name='{thread.Name}' state={thread.State} " +
+					$"imports={thread.ImportCount} nid={thread.LastImportNid} ret=0x{thread.LastReturnRip:X16} " +
+					$"reason={thread.BlockReason ?? "none"}");
+			}
+			lock (_guestThreadGate)
+			{
+				foreach (var thread in _guestThreads.Values)
+				{
+					if (thread.State == GuestThreadRunState.Running ||
+						thread.Name.Contains("Foreground", StringComparison.Ordinal) ||
+						thread.Name.Contains("FAsyncLoading", StringComparison.Ordinal) ||
+						thread.Name.Contains("IOThreadPool", StringComparison.Ordinal) ||
+						thread.Name.Contains("RHIFrameFlip", StringComparison.Ordinal) ||
+						string.Equals(thread.Name, "IoDispatcher", StringComparison.Ordinal))
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] GuestFrameChain#{num}: name='{thread.Name}' state={thread.State}");
+						TraceImportFrameChain(thread.Context, num);
+					}
+				}
+			}
 		}
 		var importEntries = _importEntries;
 		if ((uint)importIndex >= (uint)importEntries.Length)
@@ -731,8 +784,8 @@ public sealed partial class DirectExecutionBackend
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
 			IsExpectedFileProbeNotFoundNid(nid);
 		var expectedTimedWaitTimeout =
-			string.Equals(nid, "27bAgiJmOh0", StringComparison.Ordinal) &&
-			unchecked((int)result) == 60;
+			(nid is "27bAgiJmOh0" or "BmMjYxmew1w") &&
+			(result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT || unchecked((int)result) == 60);
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
@@ -941,6 +994,24 @@ public sealed partial class DirectExecutionBackend
 				: string.Empty;
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] ImportFrame#{dispatchIndex}.{i}: rbp=0x{frame:X16} ret=0x{returnRip:X16}{symbol} next=0x{next:X16}");
+			// Dreamcore's startup hang has repeatedly resolved through the same
+			// StaticLoadObject path.  Surface the UTF-16 object path held by its
+			// caller so the diagnostic identifies the cyclic/missing object rather
+			// than only reporting allocator frames below it.
+			if (returnRip == 0x000000080049C190 &&
+				next > 0x860 &&
+				context.TryReadUInt64(next - 0x860, out var textStart) &&
+				context.TryReadUInt64(next - 0x858, out var textEnd) &&
+				textEnd >= textStart && textEnd - textStart <= 4096)
+			{
+				var byteLength = checked((int)(textEnd - textStart));
+				var bytes = new byte[byteLength];
+				if (byteLength > 0 && context.Memory.TryRead(textStart, bytes))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] StaticLoadObjectPath#{dispatchIndex}: '{System.Text.Encoding.Unicode.GetString(bytes)}'");
+				}
+			}
 			if (next <= frame || next - frame > 0x100000)
 			{
 				break;
@@ -1028,6 +1099,16 @@ public sealed partial class DirectExecutionBackend
 
 	private bool ShouldForceGuestExitOnImportLoop(string nid, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
 	{
+		// Worker threads legitimately repeat timed waits, event waits, and polling
+		// imports for the lifetime of the process.  The loop detector's history is
+		// backend-wide rather than per guest thread, so recording those imports can
+		// both produce a false positive and terminate the unrelated primary thread.
+		// Keep the watchdog scoped to the primary execution it was designed to
+		// recover; worker lifetime is governed by the cooperative scheduler.
+		if (GuestThreadExecution.IsGuestThread)
+		{
+			return false;
+		}
 		if (dispatchIndex < 1200)
 		{
 			return false;
@@ -1078,7 +1159,10 @@ public sealed partial class DirectExecutionBackend
 	}
 
 	private static bool IsImportLoopGuardBoundary(string nid) =>
-		string.Equals(nid, "1jfXLRVzisc", StringComparison.Ordinal);
+		nid is
+			"1jfXLRVzisc" or // sceKernelUsleep
+			"27bAgiJmOh0" or // pthread_cond_timedwait
+			"BmMjYxmew1w";   // scePthreadCondTimedwait
 
 	private void ResetImportLoopPattern()
 	{

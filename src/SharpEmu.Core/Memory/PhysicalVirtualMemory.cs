@@ -417,6 +417,47 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    public bool Free(ulong virtualAddress, ulong memorySize)
+    {
+        if (memorySize == 0)
+        {
+            return false;
+        }
+
+        var mapStart = AlignDown(virtualAddress, PageSize);
+
+        _gate.EnterWriteLock();
+        try
+        {
+            var index = _regions.FindIndex(region => region.VirtualAddress == mapStart);
+            if (index < 0)
+            {
+                return false;
+            }
+
+            var region = _regions[index];
+            if (!VirtualFree((void*)region.VirtualAddress, 0, MEM_RELEASE))
+            {
+                return false;
+            }
+
+            _regions.RemoveAt(index);
+
+            var mapEnd = AlignUp(region.VirtualAddress + region.Size, PageSize);
+            for (var pageAddress = region.VirtualAddress; pageAddress < mapEnd; pageAddress += PageSize)
+            {
+                _pageProtections.Remove(pageAddress);
+            }
+
+            TraceVmem($"Freed segment: 0x{region.VirtualAddress:X16} - 0x{region.VirtualAddress + region.Size:X16} ({region.Size} bytes)");
+            return true;
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+    }
+
     private void ApplySegmentProtection(ulong mapStart, ulong mapEnd, ProgramHeaderFlags flags)
     {
         for (var pageAddress = mapStart; pageAddress < mapEnd; pageAddress += PageSize)

@@ -160,13 +160,37 @@ public static class KernelRuntimeCompatExports
     {
         var micros = ctx[CpuRegister.Rdi];
         TraceUsleepSpin(ctx, micros);
+        return UsleepCore(ctx, micros, "sceKernelUsleep");
+    }
+
+    // POSIX usleep(useconds_t). Unlike the game's own statically-linked usleep
+    // (which just spins/sleeps without yielding to our scheduler), this pumps the
+    // guest thread scheduler so a busy-wait that backs off with usleep — e.g. UE's
+    // render heartbeat polling until the RHI thread is ready — actually lets Ready
+    // threads run instead of starving them into a deadlock. See
+    // [[dreamcore-ue-rendering]].
+    [SysAbiExport(
+        Nid = "QcteRwbsnV0",
+        ExportName = "usleep",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePosix")]
+    public static int PosixUsleep(CpuContext ctx)
+    {
+        // useconds_t is 32-bit; ignore any stale high bits of RDI.
+        var micros = ctx[CpuRegister.Rdi] & 0xFFFFFFFFUL;
+        TraceUsleepSpin(ctx, micros);
+        return UsleepCore(ctx, micros, "usleep");
+    }
+
+    private static int UsleepCore(CpuContext ctx, ulong micros, string reason)
+    {
         if (micros == 0)
         {
             ctx[CpuRegister.Rax] = 0;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelUsleep");
+        GuestThreadExecution.Scheduler?.Pump(ctx, reason);
 
         if (micros < 1000)
         {
@@ -1481,6 +1505,20 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelIsNeoMode(CpuContext ctx)
     {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "tU5e3f9gSiU",
+        ExportName = "sceKernelIsTrinityMode",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelIsTrinityMode(CpuContext ctx)
+    {
+        // SharpEmu currently exposes the base PS5 hardware profile. Returning an
+        // error here is observable as true by SDK callers and incorrectly selects
+        // PS5 Pro/Trinity renderer and shader assets.
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

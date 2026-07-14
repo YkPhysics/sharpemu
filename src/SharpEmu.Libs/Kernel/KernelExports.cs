@@ -97,6 +97,7 @@ public static class KernelExports
     {
         var status = unchecked((int)ctx[CpuRegister.Rdi]);
         Console.Error.WriteLine($"[LOADER][INFO] catchReturnFromMain(status={status})");
+        GuestThreadExecution.RecordProcessExit("catchReturnFromMain", status);
         GuestThreadExecution.RequestCurrentEntryExit("catchReturnFromMain", status);
         ctx[CpuRegister.Rax] = unchecked((ulong)status);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -456,6 +457,7 @@ public static class KernelExports
     {
         var status = unchecked((int)ctx[CpuRegister.Rdi]);
         Console.Error.WriteLine($"[LOADER][INFO] {syscallName}(status={status})");
+        GuestThreadExecution.RecordProcessExit(syscallName, status);
         GuestThreadExecution.RequestCurrentEntryExit(syscallName, status);
         ctx[CpuRegister.Rax] = unchecked((ulong)status);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;

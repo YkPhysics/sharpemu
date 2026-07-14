@@ -169,6 +169,35 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "znaWI0gpuo8",
+        ExportName = "scePadGetTriggerEffectState",
+        Target = Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetTriggerEffectState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (handle != PrimaryPadHandle)
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        if (stateAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // No adaptive-trigger effect is active in the keyboard/XInput fallback.
+        // ScePadTriggerEffectState is 8 bytes. Writing the 0x20-byte trigger
+        // parameter size here corrupts the caller's adjacent stack storage.
+        Span<byte> state = stackalloc byte[8];
+        state.Clear();
+        return ctx.Memory.TryWrite(stateAddress, state)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
     Nid = "W2G-yoyMF5U",
     ExportName = "scePadSetVibrationMode",
     Target = Generation.Gen4 | Generation.Gen5,
