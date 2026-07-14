@@ -80,7 +80,12 @@ public static class KernelAprCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        var resultAddress = ResolveWaitResultAddress(waitArg1, waitArg2, submission.ResultAddress);
+        // sceKernelAprWaitCommandBuffer takes only the submission id. Dreamcore's
+        // call sites set EDI and deliberately leave RSI/RDX as scratch values from
+        // earlier calls, so interpreting either one as a result pointer corrupts
+        // unrelated guest memory. The result buffer belongs to the submission and
+        // was captured by sceKernelAprSubmitCommandBufferAndGetResult.
+        var resultAddress = submission.ResultAddress;
         if (resultAddress != 0 && !TryWriteAprResult(ctx, resultAddress))
         {
             TraceAprWaitFailure(ctx, "wait_result_fault", submissionId, submission.CommandBuffer, waitArg1, waitArg2);
@@ -167,27 +172,6 @@ public static class KernelAprCompatExports
         Span<byte> result = stackalloc byte[sizeof(ulong)];
         result.Clear();
         return ctx.Memory.TryWrite(resultAddress, result);
-    }
-
-    private static ulong ResolveWaitResultAddress(ulong waitArg1, ulong waitArg2, ulong submittedResultAddress)
-    {
-        if (waitArg2 == 0)
-        {
-            return submittedResultAddress;
-        }
-
-        if (IsAmprCompletionToken(waitArg1) && waitArg2 <= 0xFFFF)
-        {
-            return submittedResultAddress;
-        }
-
-        return waitArg2;
-    }
-
-    private static bool IsAmprCompletionToken(ulong value)
-    {
-        var tag = value >> 56;
-        return tag is 0x0C or 0x10;
     }
 
     private static void TraceApr(

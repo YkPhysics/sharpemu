@@ -125,6 +125,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const ulong GuestThreadRegionStride = 0x0100_0000UL;
 
+	// Number of descending slots searched in each guest-thread address window (stack and TLS).
+	// Stack window descends from 0x7FFF_E000_0000 and the TLS window from 0x7FFE_0000_0000; at this
+	// count they still terminate above one another, so they never collide.
+	private const int GuestThreadRegionSlots = 256;
+
 	private const uint PAGE_EXECUTE_READWRITE = 64u;
 
 	private const uint PAGE_READWRITE = 4u;
@@ -395,6 +400,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public CpuContext Context { get; init; } = null!;
 
+		public ulong StackRegionBase { get; init; }
+
+		public ulong StackRegionSize { get; init; }
+
+		public ulong TlsRegionBase { get; init; }
+
+		public ulong TlsRegionSize { get; init; }
+
+		public bool RegionsReleased { get; set; }
+
 		public GuestThreadRunState State { get; set; }
 
 		public ulong ExitValue { get; set; }
@@ -533,6 +548,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private int _readyGuestThreadCount;
 
 	private readonly Dictionary<ulong, GuestThreadState> _guestThreads = new Dictionary<ulong, GuestThreadState>();
+
+	// pthread_cond_signal is wake-one, and many UE worker threads intentionally
+	// share the same condition variable. Remember the last selected waiter per
+	// key so dictionary insertion order cannot starve every later worker.
+	private readonly Dictionary<string, ulong> _lastWokenGuestThreadByKey = new(StringComparer.Ordinal);
 
 	private int _guestThreadPumpDepth;
 
@@ -894,6 +914,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Volatile.Write(ref _globalUnresolvedReturnStub, (ulong)_unresolvedReturnStub);
 		result = OrbisGen2Result.ORBIS_GEN2_OK;
 		LastError = null;
+		GuestThreadExecution.ResetProcessExit();
 		InitializeRuntimeSymbolIndex(runtimeSymbols);
 		ResetLazyDlsymStubState();
 		_recentImportTraceCount = 0;
@@ -2208,7 +2229,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe void PatchTlsPatterns()
 	{
-		const ulong MaxScanBytes = 33554432uL;
+		// Large Gen5 executables routinely place TLS accesses beyond the first 32 MiB
+		// of text (Dreamcore has one around +0x3FF74CF). Scan enough of the mapped
+		// image to patch those accesses before native execution reaches them.
+		const ulong MaxScanBytes = 134217728uL;
 		ulong num = _entryPoint;
 		ulong num2 = num + MaxScanBytes;
 		int num3 = 0;
@@ -2767,14 +2791,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			return;
 		}
-		if (_guestThreadPumpDepth != 0)
+
+		if (Interlocked.CompareExchange(ref _guestThreadPumpDepth, 1, 0) != 0)
 		{
 			return;
 		}
-		_guestThreadPumpDepth++;
+		var startedHostThread = false;
 		try
 		{
-			for (int i = 0; i < 8; i++)
+			for (int i = 0; i < 64; i++)
 			{
 				GuestThreadState? thread = null;
 				lock (_guestThreadGate)
@@ -2813,11 +2838,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					thread.HostThread = hostThread;
 				}
 				hostThread.Start();
+				startedHostThread = true;
 			}
 		}
 		finally
 		{
-			_guestThreadPumpDepth--;
+			Volatile.Write(ref _guestThreadPumpDepth, 0);
+		}
+
+		if (startedHostThread)
+		{
+			// Give newly dispatched guest work a chance to reach its next
+			// synchronization point before the primary guest resumes a tight
+			// import loop. Without this fairness point UE's initial async package
+			// queue can remain pending indefinitely on Windows.
+			Thread.Sleep(1);
 		}
 	}
 
@@ -2831,20 +2866,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var wakeCount = 0;
 		lock (_guestThreadGate)
 		{
+			var candidates = new List<GuestThreadState>();
 			foreach (var thread in _guestThreads.Values)
 			{
-				if (wakeCount >= maxCount)
+				if (thread.State == GuestThreadRunState.Blocked &&
+					thread.HasBlockedContinuation &&
+					string.Equals(wakeKey, thread.BlockWakeKey, StringComparison.Ordinal))
 				{
-					break;
+					candidates.Add(thread);
 				}
+			}
 
-				if (thread.State != GuestThreadRunState.Blocked ||
-					!thread.HasBlockedContinuation ||
-					!string.Equals(wakeKey, thread.BlockWakeKey, StringComparison.Ordinal))
+			var startIndex = 0;
+			if (_lastWokenGuestThreadByKey.TryGetValue(wakeKey, out var lastHandle))
+			{
+				var lastIndex = candidates.FindIndex(candidate => candidate.ThreadHandle == lastHandle);
+				if (lastIndex >= 0)
 				{
-					continue;
+					startIndex = (lastIndex + 1) % Math.Max(1, candidates.Count);
 				}
+			}
 
+			for (var offset = 0; offset < candidates.Count && wakeCount < maxCount; offset++)
+			{
+				var thread = candidates[(startIndex + offset) % candidates.Count];
 				if (thread.BlockWakeHandler is not null && !thread.BlockWakeHandler())
 				{
 					continue;
@@ -2856,6 +2901,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				thread.BlockDeadlineTimestamp = 0;
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
+				_lastWokenGuestThreadByKey[wakeKey] = thread.ThreadHandle;
 				wakeCount++;
 			}
 		}
@@ -3026,6 +3072,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ulong entryPoint,
 		ulong arg0,
 		ulong arg1,
+		ulong arg2,
 		ulong stackAddress,
 		ulong stackSize,
 		string reason,
@@ -3045,6 +3092,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		ulong callbackStackBase;
 		ulong callbackStackSize;
+		var ownsCallbackStack = false;
 		if (stackAddress != 0 && stackSize >= 0x100)
 		{
 			callbackStackBase = stackAddress;
@@ -3057,6 +3105,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return false;
 			}
 			callbackStackSize = GuestThreadStackSize;
+			ownsCallbackStack = true;
 		}
 
 		var trackedMemory = new TrackedCpuMemory(virtualMemory);
@@ -3071,12 +3120,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.Rsp] = AlignDown(callbackStackBase + callbackStackSize, 16) - sizeof(ulong);
 		context[CpuRegister.Rdi] = arg0;
 		context[CpuRegister.Rsi] = arg1;
-		context[CpuRegister.Rdx] = 0;
+		context[CpuRegister.Rdx] = arg2;
 		context[CpuRegister.Rcx] = 0;
 		context[CpuRegister.R8] = 0;
 		context[CpuRegister.R9] = 0;
 		if (!InitializeGuestThreadFrame(context))
 		{
+			if (ownsCallbackStack)
+			{
+				virtualMemory.Free(callbackStackBase, callbackStackSize);
+			}
 			error = "failed to initialize guest callback stack";
 			return false;
 		}
@@ -3097,6 +3150,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		finally
 		{
 			LastError = previousLastError;
+			if (ownsCallbackStack)
+			{
+				virtualMemory.Free(callbackStackBase, callbackStackSize);
+			}
 		}
 	}
 
@@ -3334,6 +3391,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				.Where(static runner => runner is not null)
 				.Cast<GuestContinuationRunner>()
 				.ToArray();
+			foreach (var thread in _guestThreads.Values)
+			{
+				ReleaseGuestThreadRegions(thread);
+			}
 			_readyGuestThreads.Clear();
 			Interlocked.Exchange(ref _readyGuestThreadCount, 0);
 			_guestThreads.Clear();
@@ -3357,8 +3418,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			return false;
 		}
-		if (!TryMapGuestThreadTlsRegion(virtualMemory, out var tlsBase, out error))
+		if (!TryMapGuestThreadTlsRegion(virtualMemory, out var tlsBase, out var tlsRegionBase, out var tlsRegionSize, out error))
 		{
+			virtualMemory.Free(stackBase, GuestThreadStackSize);
 			return false;
 		}
 
@@ -3379,6 +3441,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.R9] = 0;
 		if (!InitializeGuestThreadFrame(context) || !InitializeGuestThreadTls(context, tlsBase, request.ThreadHandle))
 		{
+			virtualMemory.Free(stackBase, GuestThreadStackSize);
+			virtualMemory.Free(tlsRegionBase, tlsRegionSize);
 			error = "failed to initialize guest thread stack/TLS";
 			return false;
 		}
@@ -3391,6 +3455,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Name = string.IsNullOrWhiteSpace(request.Name) ? $"Thread-{request.ThreadHandle:X}" : request.Name,
 			Priority = request.Priority,
 			AffinityMask = request.AffinityMask,
+			StackRegionBase = stackBase,
+			StackRegionSize = GuestThreadStackSize,
+			TlsRegionBase = tlsRegionBase,
+			TlsRegionSize = tlsRegionSize,
 			Context = context,
 			State = GuestThreadRunState.Ready,
 		};
@@ -3415,6 +3483,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return false;
 	}
 
+	private static void ReleaseGuestThreadRegions(GuestThreadState thread)
+	{
+		if (thread.RegionsReleased)
+		{
+			return;
+		}
+		thread.RegionsReleased = true;
+
+		if (!TryGetVirtualMemory(thread.Context, out var virtualMemory))
+		{
+			return;
+		}
+
+		if (thread.StackRegionSize != 0)
+		{
+			virtualMemory.Free(thread.StackRegionBase, thread.StackRegionSize);
+		}
+		if (thread.TlsRegionSize != 0)
+		{
+			virtualMemory.Free(thread.TlsRegionBase, thread.TlsRegionSize);
+		}
+	}
+
 	private static bool TryMapGuestThreadRegion(
 		IVirtualMemory virtualMemory,
 		ulong baseAddress,
@@ -3423,7 +3514,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong mappedBase,
 		out string? error)
 	{
-		for (int i = 0; i < 64; i++)
+		for (int i = 0; i < GuestThreadRegionSlots; i++)
 		{
 			var candidateBase = baseAddress - ((ulong)i * GuestThreadRegionStride);
 			if (!IsGuestThreadRegionFree(virtualMemory, candidateBase, size))
@@ -3455,9 +3546,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static bool TryMapGuestThreadTlsRegion(
 		IVirtualMemory virtualMemory,
 		out ulong tlsBase,
+		out ulong tlsRegionBase,
+		out ulong tlsRegionSize,
 		out string? error)
 	{
-		for (int i = 0; i < 64; i++)
+		for (int i = 0; i < GuestThreadRegionSlots; i++)
 		{
 			var candidateBase = GuestThreadTlsBaseAddress - ((ulong)i * GuestThreadRegionStride);
 			var mappedBase = candidateBase - GuestThreadTlsPrefixSize;
@@ -3475,6 +3568,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					fileData: ReadOnlySpan<byte>.Empty,
 					protection: ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
 				tlsBase = candidateBase;
+				tlsRegionBase = mappedBase;
+				tlsRegionSize = mappedSize;
 				error = null;
 				return true;
 			}
@@ -3484,6 +3579,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 
 		tlsBase = 0;
+		tlsRegionBase = 0;
+		tlsRegionSize = 0;
 		error = $"failed to map guest TLS region near 0x{GuestThreadTlsBaseAddress:X16}";
 		return false;
 	}
@@ -3654,6 +3751,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					case GuestNativeCallExitReason.Returned:
 						thread.ExitValue = thread.Context[CpuRegister.Rax];
 						thread.State = GuestThreadRunState.Exited;
+						ReleaseGuestThreadRegions(thread);
 						break;
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
@@ -3673,6 +3771,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					default:
 						thread.State = GuestThreadRunState.Faulted;
 						thread.BlockReason = blockReason;
+						ReleaseGuestThreadRegions(thread);
 						break;
 				}
 			}
@@ -4348,6 +4447,27 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				RequestGuestThreadTeardown(3000);
 				return false;
 			}
+			// A guest that terminates via exit()/_exit()/main-return unwinds to the host
+			// with an arbitrary numeric result and may leave a stale LastError from an
+			// earlier non-fatal unresolved import. Honor the recorded process exit status
+			// instead so a clean exit(0) is reported as success, not a native-backend failure.
+			if (GuestThreadExecution.TryGetProcessExit(out var guestExitStatus, out var guestExitReason))
+			{
+				if (guestExitStatus == 0)
+				{
+					result = OrbisGen2Result.ORBIS_GEN2_OK;
+					LastError = null;
+					Console.Error.WriteLine(
+						$"[LOADER][INFO] Guest exited cleanly via {guestExitReason} (status=0)");
+					return true;
+				}
+
+				result = OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP;
+				LastError = $"Guest exited via {guestExitReason} with status {guestExitStatus}";
+				Console.Error.WriteLine("[LOADER][ERROR] " + LastError);
+				RequestGuestThreadTeardown(3000);
+				return false;
+			}
 			if (num6 == 0)
 			{
 				result = OrbisGen2Result.ORBIS_GEN2_OK;
@@ -4534,6 +4654,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			{
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
 			}
+			DumpRecentImportTrace();
+			ulong framePointer = cpuContext[CpuRegister.Rbp];
+			for (int frameIndex = 0; frameIndex < 16 && framePointer != 0; frameIndex++)
+			{
+				if (!cpuContext.TryReadUInt64(framePointer, out var previousFramePointer) ||
+					!cpuContext.TryReadUInt64(framePointer + 8, out var returnAddress))
+				{
+					break;
+				}
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] Stall frame#{frameIndex}: rbp=0x{framePointer:X16} ret=0x{returnAddress:X16}");
+				if (previousFramePointer <= framePointer || previousFramePointer - framePointer > 0x100000)
+				{
+					break;
+				}
+				framePointer = previousFramePointer;
+			}
 
 			var threads = SnapshotGuestThreads();
 			if (threads.Length != 0)
@@ -4560,6 +4697,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
 						$"block={thread.BlockReason ?? "none"}{hostContextText}");
+					if (Interlocked.Read(ref thread.ImportCount) >= 10_000)
+					{
+						var threadContext = thread.Context;
+						ulong threadFramePointer = threadContext[CpuRegister.Rbp];
+						Console.Error.WriteLine(
+							$"[LOADER][ERROR] Stall guest-context: handle=0x{thread.ThreadHandle:X16} " +
+							$"rip=0x{threadContext.Rip:X16} rsp=0x{threadContext[CpuRegister.Rsp]:X16} rbp=0x{threadFramePointer:X16}");
+						for (int frameIndex = 0; frameIndex < 12 && threadFramePointer != 0; frameIndex++)
+						{
+							if (!threadContext.TryReadUInt64(threadFramePointer, out var previousFramePointer) ||
+								!threadContext.TryReadUInt64(threadFramePointer + 8, out var returnAddress))
+							{
+								break;
+							}
+							Console.Error.WriteLine(
+								$"[LOADER][ERROR] Stall guest-frame#{frameIndex}: handle=0x{thread.ThreadHandle:X16} " +
+								$"rbp=0x{threadFramePointer:X16} ret=0x{returnAddress:X16}");
+							if (previousFramePointer <= threadFramePointer || previousFramePointer - threadFramePointer > 0x100000)
+							{
+								break;
+							}
+							threadFramePointer = previousFramePointer;
+						}
+					}
 					logged++;
 					if (logged >= 48 && threads.Length > logged)
 					{

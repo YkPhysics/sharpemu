@@ -1530,6 +1530,7 @@ public static class KernelMemoryCompatExports
         }
 
         var hostPath = ResolveGuestPath(guestPath);
+        TryMaterializeSyntheticDescriptor(guestPath, hostPath);
         var access = ResolveOpenAccess(flags);
         var mode = ResolveOpenMode(flags, access);
         try
@@ -1644,6 +1645,7 @@ public static class KernelMemoryCompatExports
         }
 
         var hostPath = ResolveGuestPath(guestPath);
+        TryMaterializeSyntheticDescriptor(guestPath, hostPath);
         var statCacheKey = GetNegativeStatCacheKey(guestPath);
         if (statCacheKey is not null && IsNegativeStatCached(statCacheKey))
         {
@@ -2057,6 +2059,69 @@ public static class KernelMemoryCompatExports
         LibraryName = "libKernel")]
     public static int KernelRead(CpuContext ctx) => KernelReadUnderscore(ctx);
 
+    // Positional read: pread(fd, buf, nbytes, offset). Unreal Engine uses this to read its
+    // project descriptor and cooked pak/IoStore files, so it must not disturb the file
+    // position (POSIX pread semantics).
+    [SysAbiExport(
+        Nid = "+r3rMFwItV4",
+        ExportName = "pread",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelPread(CpuContext ctx)
+    {
+        var fd = unchecked((int)ctx[CpuRegister.Rdi]);
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
+        var offset = unchecked((long)ctx[CpuRegister.Rcx]);
+        if (requested < 0 || offset < 0 || (requested > 0 && bufferAddress == 0))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (requested == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        FileStream? stream;
+        lock (_fdGate)
+        {
+            _openFiles.TryGetValue(fd, out stream);
+        }
+
+        if (stream is null)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        int read;
+        try
+        {
+            var savedPosition = stream.Position;
+            stream.Seek(offset, SeekOrigin.Begin);
+            var buffer = GC.AllocateUninitializedArray<byte>(requested);
+            read = stream.Read(buffer, 0, requested);
+            stream.Position = savedPosition;
+            if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            LogIoTrace(
+                "pread",
+                stream.Name,
+                $"fd={fd} off={offset} req={requested} read={read} preview='{PreviewIoBytes(buffer, read, 64)}'");
+        }
+        catch (IOException)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        ctx[CpuRegister.Rax] = unchecked((ulong)read);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "Oy6IpwgtYOk",
         ExportName = "lseek",
@@ -2255,6 +2320,46 @@ public static class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int KernelWrite(CpuContext ctx) => KernelWriteUnderscore(ctx);
+
+    [SysAbiExport(
+        Nid = "fTx66l5iWIA",
+        ExportName = "sceKernelFsync",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelFsync(CpuContext ctx)
+    {
+        var fd = unchecked((int)ctx[CpuRegister.Rdi]);
+        if (fd is 1 or 2)
+        {
+            if (fd == 1)
+            {
+                Console.Out.Flush();
+            }
+            else
+            {
+                Console.Error.Flush();
+            }
+
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        FileStream? stream;
+        lock (_fdGate)
+        {
+            _openFiles.TryGetValue(fd, out stream);
+        }
+
+        if (stream is null)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        // KernelWriteUnderscore flushes every successful guest write before it
+        // returns.  A second FileStream.Flush here enters a blocking Windows flush
+        // syscall and can park Unreal's async writer indefinitely, so validating
+        // the descriptor is sufficient to provide the guest-visible barrier.
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 
     [SysAbiExport(
         Nid = "lLMT9vJAck0",
@@ -4423,6 +4528,34 @@ public static class KernelMemoryCompatExports
 
     public static string ResolveGuestPath(string guestPath)
     {
+        var result = ResolveGuestPathCore(guestPath);
+
+        // Always-on diagnostic for the UE project descriptor lookup - the current boot
+        // blocker. Fires only for .uproject paths so it stays quiet otherwise, and reports
+        // exactly how the guest path maps to a host path plus the active mount roots.
+        if (!string.IsNullOrEmpty(guestPath) &&
+            guestPath.Contains("uproject", StringComparison.OrdinalIgnoreCase))
+        {
+            bool exists;
+            try
+            {
+                exists = File.Exists(result) || Directory.Exists(result);
+            }
+            catch
+            {
+                exists = false;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][DIAG] descriptor resolve: guest='{guestPath}' -> host='{result}' " +
+                $"exists={exists} app0='{ResolveApp0Root()}' devlog='{ResolveDevlogAppRoot()}'");
+        }
+
+        return result;
+    }
+
+    private static string ResolveGuestPathCore(string guestPath)
+    {
         if (string.IsNullOrWhiteSpace(guestPath))
         {
             return guestPath;
@@ -4435,14 +4568,12 @@ public static class KernelMemoryCompatExports
 
         if (guestPath.StartsWith("/devlog/app/", StringComparison.OrdinalIgnoreCase))
         {
-            var relative = NormalizeMountRelativePath(guestPath["/devlog/app/".Length..]);
-            return Path.Combine(ResolveDevlogAppRoot(), relative);
+            return ResolveDevlogAppPath(guestPath["/devlog/app/".Length..]);
         }
 
         if (guestPath.StartsWith("devlog/app/", StringComparison.OrdinalIgnoreCase))
         {
-            var relative = NormalizeMountRelativePath(guestPath["devlog/app/".Length..]);
-            return Path.Combine(ResolveDevlogAppRoot(), relative);
+            return ResolveDevlogAppPath(guestPath["devlog/app/".Length..]);
         }
 
         if (string.Equals(guestPath, "/devlog/app", StringComparison.OrdinalIgnoreCase) ||
@@ -4633,6 +4764,31 @@ public static class KernelMemoryCompatExports
         return root;
     }
 
+    // Resolves a path under the /devlog/app mount. Some titles - notably Unreal Engine PS4/PS5
+    // builds - treat /devlog/app as the game's filesystem root and read all of their content
+    // (paks, movies, engine data) from under it. The loader binds the package root to app0, so
+    // when the requested file actually exists under app0 we serve it from there. Anything not
+    // present under app0 (log/save output that the guest writes, or files the package simply
+    // does not ship) falls back to the writable devlog scratch root, preserving prior behavior
+    // for titles that use /devlog/app purely as a log mount.
+    private static string ResolveDevlogAppPath(string relative)
+    {
+        var normalized = NormalizeMountRelativePath(relative);
+
+        var app0Root = ResolveApp0Root();
+        if (!string.IsNullOrWhiteSpace(app0Root))
+        {
+            var app0Candidate = Path.GetFullPath(Path.Combine(app0Root, normalized));
+            if (File.Exists(app0Candidate) || Directory.Exists(app0Candidate))
+            {
+                return app0Candidate;
+            }
+        }
+
+        var devlogRoot = ResolveDevlogAppRoot();
+        return Path.GetFullPath(Path.Combine(devlogRoot, normalized));
+    }
+
     private static string ResolveTemp0Root()
     {
         const string temp0VariableName = "SHARPEMU_TEMP0_DIR";
@@ -4739,6 +4895,64 @@ public static class KernelMemoryCompatExports
         if (!string.IsNullOrWhiteSpace(parentDirectory))
         {
             Directory.CreateDirectory(parentDirectory);
+        }
+    }
+
+    // The Unreal Engine boot path fatally aborts (GEngineLoop.PreInit Failed) if it cannot open
+    // its project descriptor (*.uproject). Cooked/packaged builds do not ship the descriptor, so
+    // when the guest opens or stats one that is not on disk we materialize a minimal valid
+    // descriptor at the resolved host path. This lets IProjectManager::LoadProjectFile succeed
+    // and the engine continue booting. Disable with SHARPEMU_NO_SYNTH_DESCRIPTOR=1.
+    private static void TryMaterializeSyntheticDescriptor(string guestPath, string hostPath)
+    {
+        if (string.IsNullOrWhiteSpace(hostPath) ||
+            string.IsNullOrEmpty(guestPath) ||
+            !guestPath.EndsWith(".uproject", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_NO_SYNTH_DESCRIPTOR"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(hostPath))
+            {
+                return;
+            }
+
+            var parentDirectory = Path.GetDirectoryName(hostPath);
+            if (!string.IsNullOrWhiteSpace(parentDirectory))
+            {
+                Directory.CreateDirectory(parentDirectory);
+            }
+
+            var moduleName = Path.GetFileNameWithoutExtension(hostPath);
+            moduleName = string.IsNullOrWhiteSpace(moduleName)
+                ? "Game"
+                : char.ToUpperInvariant(moduleName[0]) + moduleName[1..];
+
+            var descriptor =
+                "{\n" +
+                "\t\"FileVersion\": 3,\n" +
+                "\t\"EngineAssociation\": \"\",\n" +
+                "\t\"Category\": \"\",\n" +
+                "\t\"Description\": \"\",\n" +
+                "\t\"Modules\": [\n" +
+                "\t\t{\n" +
+                $"\t\t\t\"Name\": \"{moduleName}\",\n" +
+                "\t\t\t\"Type\": \"Runtime\",\n" +
+                "\t\t\t\"LoadingPhase\": \"Default\"\n" +
+                "\t\t}\n" +
+                "\t]\n" +
+                "}\n";
+            File.WriteAllText(hostPath, descriptor);
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Synthesized missing project descriptor '{guestPath}' -> '{hostPath}' (module='{moduleName}')");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Failed to synthesize descriptor '{hostPath}': {ex.GetType().Name}: {ex.Message}");
         }
     }
 

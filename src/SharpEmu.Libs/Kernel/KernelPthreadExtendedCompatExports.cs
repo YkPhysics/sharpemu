@@ -1187,6 +1187,9 @@ public static class KernelPthreadExtendedCompatExports
         LibraryName = "libKernel")]
     public static int OrbisPthreadSetspecific(CpuContext ctx) => PosixPthreadSetspecific(ctx);
 
+    [ThreadStatic]
+    private static int _getspecificPumpCounter;
+
     [SysAbiExport(
         Nid = "0-KXaS70xy4",
         ExportName = "pthread_getspecific",
@@ -1194,6 +1197,15 @@ public static class KernelPthreadExtendedCompatExports
         LibraryName = "libKernel")]
     public static int PosixPthreadGetspecific(CpuContext ctx)
     {
+        // UE's render heartbeat busy-waits on pthread_getspecific until the RHI
+        // thread comes up; getspecific never blocks, so it never pumps the
+        // cooperative scheduler and the woken-but-undispatched RHIThread starves
+        // (render-init deadlock). Rate-limited pump breaks that starvation.
+        if ((++_getspecificPumpCounter & 0x3F) == 0)
+        {
+            GuestThreadExecution.Scheduler?.Pump(ctx, "pthread_getspecific");
+        }
+
         var key = unchecked((int)ctx[CpuRegister.Rdi]);
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
         ulong value = 0;
