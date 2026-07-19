@@ -36,7 +36,6 @@ public partial class MainWindow : Window
     private const int MaxConsoleLinesPerFlush = 500;
     private const double LaunchBlurRadius = 12;
     private const double BlurTransitionSeconds = 0.24;
-    private const double GameRevealSeconds = 0.45;
 
     private static readonly IBrush DefaultLineBrush = new SolidColorBrush(Color.Parse("#C7CFDE"));
     private static readonly IBrush DimLineBrush = new SolidColorBrush(Color.Parse("#6B7488"));
@@ -111,9 +110,12 @@ public partial class MainWindow : Window
     // Eases the tile strip toward keeping the selected tile centered.
     private readonly DispatcherTimer _stripScrollTimer;
 
-    // Fades the freshly presented game surface in over the blurred library.
-    private readonly DispatcherTimer _gameRevealTimer;
-    private long _gameRevealStartedAt;
+    // Orchestrates the two-phase reveal of a freshly presented game
+    // (launcher fades to black, then the game fades up from the black).
+    // While it runs, console flushing pauses so boot-log floods cannot
+    // stutter the animation.
+    private CancellationTokenSource? _gameRevealCts;
+    private bool _gameRevealInProgress;
 
     // Title-bar clock, console style.
     private readonly DispatcherTimer _clockTimer;
@@ -342,12 +344,6 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromMilliseconds(16),
         };
         _stripScrollTimer.Tick += (_, _) => AdvanceStripCentering();
-
-        _gameRevealTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(16),
-        };
-        _gameRevealTimer.Tick += (_, _) => AdvanceGameReveal();
 
         ClockText.Text = DateTime.Now.ToString("HH:mm");
         _clockTimer = new DispatcherTimer
@@ -1036,7 +1032,7 @@ public partial class MainWindow : Window
         _libraryBlurTimer.Stop();
         _gamepadTimer.Stop();
         _stripScrollTimer.Stop();
-        _gameRevealTimer.Stop();
+        _gameRevealCts?.Cancel();
         _clockTimer.Stop();
         _sndPreview.Stop();
         _discord?.Dispose();
@@ -2339,22 +2335,22 @@ public partial class MainWindow : Window
             if (_isRunning && !_isStopping)
             {
                 _awaitingFirstFrame = false;
-                MainContent.Margin = new Thickness(0);
-                RestoreGameViewToFull();
                 HideSessionLoading();
-                BeginGameReveal();
+                _ = RunGameRevealAsync();
             }
         });
     }
 
     /// <summary>
-    /// Eases the freshly presented game surface in over the blurred library
-    /// instead of popping it over the whole window. The blurred launcher
-    /// stays visible underneath while the native child's composed alpha
-    /// ramps up; the library chrome is dismantled only once the game is
-    /// fully opaque. Platforms without per-window alpha reveal instantly.
+    /// Console-style two-phase reveal of a freshly presented game. Phase 1
+    /// dips the launcher to black with a GPU-composited scrim; the swap to
+    /// the native surface then happens invisibly under full black, and in
+    /// phase 2 the surface's composed alpha rises out of the black with
+    /// render-loop-synced frames. Platforms without per-window alpha skip
+    /// phase 2 and appear at the phase boundary, which still reads as a
+    /// clean fade-through-black rather than a pop over the library.
     /// </summary>
-    private void BeginGameReveal()
+    private async Task RunGameRevealAsync()
     {
         var host = _gameSurfaceHost;
         if (host is null)
@@ -2362,63 +2358,124 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (host.TrySetPresentationOpacity(0))
+        _gameRevealCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _gameRevealCts = cts;
+        _gameRevealInProgress = true;
+        try
         {
+            var supportsAlpha = host.TrySetPresentationOpacity(0);
+
+            RevealScrim.Opacity = 0;
+            RevealScrim.IsVisible = true;
+            await FadeAsync(RevealScrim, 0, 1, TimeSpan.FromMilliseconds(220), new CubicEaseIn(), cts.Token);
+            if (cts.IsCancellationRequested || !_isRunning || _isStopping ||
+                !ReferenceEquals(_gameSurfaceHost, host))
+            {
+                return;
+            }
+
+            // Fully black now: dismantle the launcher chrome and attach the
+            // surface where nobody can see the seam.
+            ClearLibraryBlur();
+            MainContent.Margin = new Thickness(0);
+            RestoreGameViewToFull();
+            GameView.Background = Brushes.Black;
+            LibraryPage.IsVisible = false;
+            OptionsPage.IsVisible = false;
+            LibraryToolbar.IsVisible = false;
+            ContentToolbar.IsVisible = false;
+            ConsolePanel.IsVisible = false;
+            LaunchBar.IsVisible = false;
             host.SetPresentationVisible(true);
+
+            if (supportsAlpha)
+            {
+                await FadeSurfaceInAsync(host, TimeSpan.FromMilliseconds(340), cts.Token);
+            }
+
+            if (cts.IsCancellationRequested || !_isRunning || _isStopping ||
+                !ReferenceEquals(_gameSurfaceHost, host))
+            {
+                return;
+            }
+
+            GameView.IsHitTestVisible = true;
             host.SetCursorAutoHide(true);
-            _gameRevealStartedAt = Stopwatch.GetTimestamp();
-            _gameRevealTimer.Start();
-            return;
+            UpdateSessionBarVisibility();
         }
-
-        host.SetPresentationVisible(true);
-        host.SetCursorAutoHide(true);
-        CompleteGameReveal();
-    }
-
-    private void AdvanceGameReveal()
-    {
-        var host = _gameSurfaceHost;
-        if (host is null || !_isRunning || _isStopping)
+        catch (OperationCanceledException)
         {
-            // Session ended mid-fade; drop the layered style so the next
-            // launch does not inherit a transparent surface.
-            _gameRevealTimer.Stop();
-            _gameSurfaceHost?.TrySetPresentationOpacity(1);
-            return;
+            // A teardown path cancelled the reveal; its cleanup runs below.
         }
-
-        var elapsed = (Stopwatch.GetTimestamp() - _gameRevealStartedAt) /
-                      (double)Stopwatch.Frequency;
-        var progress = Math.Clamp(elapsed / GameRevealSeconds, 0, 1);
-        var easedProgress = 1 - Math.Pow(1 - progress, 3);
-        host.TrySetPresentationOpacity(easedProgress * 0.999);
-
-        if (progress >= 1)
+        finally
         {
-            _gameRevealTimer.Stop();
-            CompleteGameReveal();
+            if (ReferenceEquals(_gameRevealCts, cts))
+            {
+                _gameRevealInProgress = false;
+                RevealScrim.IsVisible = false;
+                _gameSurfaceHost?.TrySetPresentationOpacity(1);
+            }
         }
     }
 
-    private void CompleteGameReveal()
+    /// <summary>
+    /// Opacity keyframe fade driven by Avalonia's animation clock.
+    /// </summary>
+    private static Task FadeAsync(
+        Visual target, double from, double to, TimeSpan duration, Easing easing, CancellationToken token)
     {
-        _gameSurfaceHost?.TrySetPresentationOpacity(1);
-        if (!_isRunning || _isStopping)
+        var animation = new Animation
         {
-            return;
+            Duration = duration,
+            Easing = easing,
+            FillMode = FillMode.Forward,
+            Children =
+            {
+                new KeyFrame { Cue = new Cue(0), Setters = { new Setter(OpacityProperty, from) } },
+                new KeyFrame { Cue = new Cue(1), Setters = { new Setter(OpacityProperty, to) } },
+            },
+        };
+        return animation.RunAsync(target, token);
+    }
+
+    /// <summary>
+    /// Ramps the native surface's composed alpha with frames scheduled by
+    /// the compositor (RequestAnimationFrame) rather than a wall-clock
+    /// timer, so the fade cannot beat against the render loop. Progress is
+    /// still computed from elapsed time, so a busy frame skips ahead
+    /// instead of slowing the fade down.
+    /// </summary>
+    private Task FadeSurfaceInAsync(GameSurfaceHost host, TimeSpan duration, CancellationToken token)
+    {
+        var completion = new TaskCompletionSource();
+        var startedAt = Stopwatch.GetTimestamp();
+
+        void OnFrame(TimeSpan _)
+        {
+            if (token.IsCancellationRequested || !ReferenceEquals(_gameSurfaceHost, host))
+            {
+                completion.TrySetResult();
+                return;
+            }
+
+            var elapsed = (Stopwatch.GetTimestamp() - startedAt) / (double)Stopwatch.Frequency;
+            var progress = Math.Clamp(elapsed / duration.TotalSeconds, 0, 1);
+            var easedProgress = 1 - Math.Pow(1 - progress, 3);
+            // 0.999 keeps the layered style applied for the whole ramp; the
+            // caller removes it once with a final opacity of exactly 1.
+            host.TrySetPresentationOpacity(Math.Min(easedProgress, 0.999));
+            if (progress >= 1)
+            {
+                completion.TrySetResult();
+                return;
+            }
+
+            RequestAnimationFrame(OnFrame);
         }
 
-        ClearLibraryBlur();
-        GameView.Background = Brushes.Black;
-        GameView.IsHitTestVisible = true;
-        LibraryPage.IsVisible = false;
-        OptionsPage.IsVisible = false;
-        LibraryToolbar.IsVisible = false;
-        ContentToolbar.IsVisible = false;
-        ConsolePanel.IsVisible = false;
-        LaunchBar.IsVisible = false;
-        UpdateSessionBarVisibility();
+        RequestAnimationFrame(OnFrame);
+        return completion.Task;
     }
 
     private GameSurfaceHost EnsureGameSurfaceHost()
@@ -2509,7 +2566,8 @@ public partial class MainWindow : Window
             OnWindowFullScreen(this, new RoutedEventArgs());
         }
 
-        _gameRevealTimer.Stop();
+        _gameRevealCts?.Cancel();
+        RevealScrim.IsVisible = false;
         _gameSurfaceHost?.TrySetPresentationOpacity(1);
         _gameSurfaceHost?.SetCursorAutoHide(false);
         _gameSurfaceHost?.SetPresentationVisible(false);
@@ -2623,6 +2681,9 @@ public partial class MainWindow : Window
         // crash the GUI; parking it in the 1x1 corner lets the library
         // recover — and stay clickable — while the native closing popup
         // reports teardown progress.
+        _gameRevealCts?.Cancel();
+        RevealScrim.IsVisible = false;
+        _gameSurfaceHost?.TrySetPresentationOpacity(1);
         _gameSurfaceHost?.SetPresentationVisible(false);
         _awaitingFirstFrame = false;
         ParkGameViewOffscreen();
@@ -2706,7 +2767,8 @@ public partial class MainWindow : Window
 
     private void UpdateSessionBarVisibility()
     {
-        SessionBarPopup.IsOpen = _isRunning && !_isStopping && !_awaitingFirstFrame && GameView.IsVisible &&
+        SessionBarPopup.IsOpen = _isRunning && !_isStopping && !_awaitingFirstFrame &&
+            !_gameRevealInProgress && GameView.IsVisible &&
             !_gameFullscreen && WindowState != WindowState.FullScreen;
     }
 
@@ -2714,7 +2776,9 @@ public partial class MainWindow : Window
 
     private void FlushPendingConsoleLines()
     {
-        if (_pendingLines.IsEmpty)
+        // Boot logs flood in exactly while the reveal animation runs; defer
+        // the (potentially heavy) list work until the fade has landed.
+        if (_gameRevealInProgress || _pendingLines.IsEmpty)
         {
             return;
         }

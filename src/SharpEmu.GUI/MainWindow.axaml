@@ -669,5 +669,11 @@ SPDX-License-Identifier: GPL-2.0-or-later
       <TextBlock x:Name="StatusBarRight" Grid.Column="1" Text="" FontSize="11"
                  Foreground="{StaticResource FaintBrush}" VerticalAlignment="Center" Margin="16,0" />
     </Grid>
+
+    <!-- Fade-to-black layer for the game reveal: the launcher dips to black
+         before the native surface appears, then the game fades up from the
+         black underneath it. Last Avalonia child so it covers everything. -->
+    <Border x:Name="RevealScrim" Grid.Row="0" Grid.RowSpan="3" Background="Black"
+            IsVisible="False" Opacity="0" />
   </Grid>
 </Window>
