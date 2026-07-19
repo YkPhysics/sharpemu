@@ -643,10 +643,17 @@ SPDX-License-Identifier: GPL-2.0-or-later
          stacks above it) and clicking it closes the overlay. Opened only
          while a game is presented; driven by the gamepad (d-pad +
          Cross/Circle) and the mouse. -->
+    <!-- Anchor+gravity with constraint adjustment disabled: the sheet is
+         nearly the size of the work area, and any "slide to fit" from the
+         popup positioner can relocate it to another monitor in windowed
+         mode. Pin its top-left to the window's top-left instead. -->
     <primitives:Popup x:Name="GameOverlayPopup"
                       IsOpen="False"
                       PlacementTarget="{Binding #RootLayout}"
-                      Placement="Center"
+                      Placement="AnchorAndGravity"
+                      PlacementAnchor="TopLeft"
+                      PlacementGravity="BottomRight"
+                      PlacementConstraintAdjustment="None"
                       Topmost="True"
                       ShouldUseOverlayLayer="False"
                       TakesFocusFromNativeControl="False"
