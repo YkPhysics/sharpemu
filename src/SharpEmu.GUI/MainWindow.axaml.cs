@@ -621,12 +621,9 @@ public partial class MainWindow : Window
         // DualSense wins when both are connected; XInput covers Xbox pads.
         if (!WindowsDualSenseReader.TryGetState(out var pad) && !WindowsXInputReader.TryGetState(out pad))
         {
-            PadIndicator.IsVisible = false;
             _previousPadButtons = HostGamepadButtons.None;
             return;
         }
-
-        PadIndicator.IsVisible = true;
 
         if (!IsActive && !_overlayWindow.IsActive)
         {

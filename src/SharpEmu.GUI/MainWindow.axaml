@@ -68,16 +68,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
         </Border>
       </StackPanel>
 
-      <!-- Console-style clock and controller indicator; the right margin
-           clears the system caption buttons drawn over the client area. -->
-      <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,0,150,0"
-                  HorizontalAlignment="Right" VerticalAlignment="Center">
-        <Border x:Name="PadIndicator" Classes="pill" IsVisible="False"
-                ToolTip.Tip="Controller connected">
-          <TextBlock Text="🎮" FontSize="12" />
-        </Border>
-        <TextBlock x:Name="ClockText" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center" />
-      </StackPanel>
+      <!-- Console-style clock; the right margin clears the system caption
+           buttons drawn over the client area. -->
+      <TextBlock x:Name="ClockText" FontSize="15" FontWeight="SemiBold" Margin="0,0,150,0"
+                 HorizontalAlignment="Right" VerticalAlignment="Center" />
     </Grid>
 
     <!-- Main content -->
