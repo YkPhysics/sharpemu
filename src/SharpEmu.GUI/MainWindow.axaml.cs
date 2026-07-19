@@ -137,7 +137,11 @@ public partial class MainWindow : Window
     private bool _gameOverlayOpen;
     private int _overlayTileIndex;
     private (Button Button, TextBlock Label, Action Action)[] _overlayTiles = [];
-    private DateTime _sessionStartedAt;
+    private CancellationTokenSource? _overlayCardAnimationCts;
+    private CancellationTokenSource? _overlayDimAnimationCts;
+    private string? _runningEbootPath;
+    private bool _screenshotInProgress;
+    private int _toastGeneration;
 
     //Github http client for latest commit
     private static readonly HttpClient GithubHttpClient = CreateGithubHttpClient();
@@ -373,6 +377,7 @@ public partial class MainWindow : Window
         _overlayTiles =
         [
             (OverlayResumeButton, OverlayResumeLabel, CloseGameOverlay),
+            (OverlayScreenshotButton, OverlayScreenshotLabel, () => _ = CaptureGameScreenshotAsync()),
             (OverlayFullscreenButton, OverlayFullscreenLabel, () =>
             {
                 CloseGameOverlay();
@@ -2196,6 +2201,7 @@ public partial class MainWindow : Window
 
         _isRunning = true;
         _runningGameName = displayName;
+        _runningEbootPath = Path.GetFullPath(ebootPath);
         SessionGameTitle.Text = displayName;
         _runningGameTitleId = resolvedTitleId;
         _runningSinceUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -2630,7 +2636,6 @@ public partial class MainWindow : Window
     {
         _isStopping = false;
         _awaitingFirstFrame = true;
-        _sessionStartedAt = DateTime.UtcNow;
         var host = EnsureGameSurfaceHost();
         ParkGameViewOffscreen();
         GameView.IsVisible = true;
@@ -2855,7 +2860,8 @@ public partial class MainWindow : Window
     private void UpdateSessionBarVisibility()
     {
         SessionBarPopup.IsOpen = _isRunning && !_isStopping && !_awaitingFirstFrame &&
-            !_gameRevealInProgress && !_gameOverlayOpen && GameView.IsVisible &&
+            !_gameRevealInProgress && !_gameOverlayOpen && !_screenshotInProgress &&
+            GameView.IsVisible &&
             !_gameFullscreen && WindowState != WindowState.FullScreen;
     }
 
@@ -2882,10 +2888,21 @@ public partial class MainWindow : Window
 
         _gameOverlayOpen = true;
         _overlayTileIndex = 0;
-        OverlayGameTitle.Text = SessionGameTitle.Text;
+        OverlayGameTitle.Text = _runningGameName ?? SessionGameTitle.Text;
+        OverlayTitleIdPill.IsVisible = !string.IsNullOrWhiteSpace(_runningGameTitleId);
+        OverlayTitleIdText.Text = _runningGameTitleId ?? string.Empty;
+        UpdateOverlayCover();
         UpdateOverlayStatus();
         UpdateOverlaySelection();
+
+        // Dim layer first so the card's popup stacks above it; both are
+        // sized/laid out by their popups, the dim to the whole game view.
+        OverlayDimLayer.Width = GameView.Bounds.Width;
+        OverlayDimLayer.Height = GameView.Bounds.Height;
+        GameOverlayDimPopup.IsOpen = true;
         GameOverlayPopup.IsOpen = true;
+        AnimateSlideFadeIn(OverlayDimLayer, ref _overlayDimAnimationCts, 0);
+        AnimateSlideFadeIn(OverlayCard, ref _overlayCardAnimationCts, 26);
         UpdateSessionBarVisibility();
     }
 
@@ -2898,7 +2915,42 @@ public partial class MainWindow : Window
 
         _gameOverlayOpen = false;
         GameOverlayPopup.IsOpen = false;
+        GameOverlayDimPopup.IsOpen = false;
         UpdateSessionBarVisibility();
+    }
+
+    /// <summary>
+    /// Shows the running game's cover art in the overlay's game card, or an
+    /// initials placeholder when the session was launched from a bare eboot
+    /// with no library entry.
+    /// </summary>
+    private void UpdateOverlayCover()
+    {
+        var entry = _runningEbootPath is { } ebootPath
+            ? _allGames.FirstOrDefault(candidate =>
+                string.Equals(candidate.Path, ebootPath, FilePathComparison))
+            : null;
+        var cover = entry?.Cover;
+        OverlayCoverImage.Source = cover;
+        OverlayCoverImage.IsVisible = cover is not null;
+        OverlayCoverFallback.IsVisible = cover is null;
+        if (entry?.PlaceholderBrush is { } placeholder)
+        {
+            OverlayCoverFallback.Background = placeholder;
+        }
+
+        OverlayCoverInitials.Text = entry?.Initials ?? InitialsFor(_runningGameName);
+    }
+
+    private static string InitialsFor(string? name)
+    {
+        var parts = name?.Split(' ', StringSplitOptions.RemoveEmptyEntries) ?? [];
+        return parts.Length switch
+        {
+            0 => "?",
+            1 => char.ToUpperInvariant(parts[0][0]).ToString(),
+            _ => $"{char.ToUpperInvariant(parts[0][0])}{char.ToUpperInvariant(parts[1][0])}",
+        };
     }
 
     private void UpdateOverlaySelection()
@@ -2908,17 +2960,98 @@ public partial class MainWindow : Window
             var focused = tileIndex == _overlayTileIndex;
             var tile = _overlayTiles[tileIndex];
             tile.Button.Classes.Set("focused", focused);
-            tile.Label.Opacity = focused ? 1.0 : 0.55;
+            // PS5 style: only the focused tile shows its label.
+            tile.Label.Opacity = focused ? 1.0 : 0.0;
         }
     }
 
     private void UpdateOverlayStatus()
     {
         OverlayClockText.Text = DateTime.Now.ToString("HH:mm");
-        var elapsed = DateTime.UtcNow - _sessionStartedAt;
+
+        var elapsed = TimeSpan.FromSeconds(
+            Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeSeconds() - _runningSinceUnixSeconds));
         OverlayElapsedText.Text = elapsed.TotalHours >= 1
             ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes}m"
-            : $"{Math.Max(0, elapsed.Minutes)}m";
+            : $"{elapsed.Minutes}m";
+
+        // Controller battery, DualSense preferred (real percentage from the
+        // HID report) with the coarse XInput level as fallback.
+        if (WindowsDualSenseReader.TryGetBattery(out var percent, out var charging) ||
+            WindowsXInputReader.TryGetBattery(out percent, out charging))
+        {
+            OverlayBatteryPanel.IsVisible = true;
+            OverlayBatteryText.Text = charging ? $"{percent}% ⚡" : $"{percent}%";
+            OverlayBatteryFill.Width = Math.Max(1, 14.0 * percent / 100);
+        }
+        else
+        {
+            OverlayBatteryPanel.IsVisible = false;
+        }
+    }
+
+    /// <summary>
+    /// Captures the presented game frame by grabbing the game view's screen
+    /// region, PS-style Create button. The overlay (and session bar) hide
+    /// first so only the game lands in the picture.
+    /// </summary>
+    private async Task CaptureGameScreenshotAsync()
+    {
+        if (!OperatingSystem.IsWindows() || !_isRunning || _isStopping || !GameView.IsVisible)
+        {
+            return;
+        }
+
+        _screenshotInProgress = true;
+        CloseGameOverlay();
+        try
+        {
+            // Let the popups actually disappear from the screen first.
+            await Task.Delay(180);
+            if (!_isRunning || _isStopping)
+            {
+                return;
+            }
+
+            var origin = GameView.PointToScreen(new Point(0, 0));
+            var scale = (this as TopLevel).RenderScaling;
+            var width = Math.Max(1, (int)Math.Round(GameView.Bounds.Width * scale));
+            var height = Math.Max(1, (int)Math.Round(GameView.Bounds.Height * scale));
+
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "SharpEmu");
+            Directory.CreateDirectory(directory);
+            var safeName = string.Join("_", (_runningGameName ?? "game").Split(Path.GetInvalidFileNameChars()));
+            var fileName = $"{safeName}-{DateTime.Now:yyyyMMdd-HHmmss}.png";
+            var filePath = Path.Combine(directory, fileName);
+
+            await Task.Run(() => ScreenCapture.CaptureToPng(origin.X, origin.Y, width, height, filePath));
+            AppendConsoleLine($"[GUI][INFO] Screenshot saved: {filePath}", SuccessLineBrush);
+            ShowToast("Screenshot saved");
+        }
+        catch (Exception exception)
+        {
+            AppendConsoleLine($"[GUI][WARN] Screenshot failed: {exception.Message}", WarningLineBrush);
+        }
+        finally
+        {
+            _screenshotInProgress = false;
+            UpdateSessionBarVisibility();
+        }
+    }
+
+    private void ShowToast(string message)
+    {
+        var generation = ++_toastGeneration;
+        ToastText.Text = message;
+        ToastPopup.IsOpen = true;
+        DispatcherTimer.RunOnce(() =>
+        {
+            if (generation == _toastGeneration)
+            {
+                ToastPopup.IsOpen = false;
+            }
+        }, TimeSpan.FromSeconds(2.5));
     }
 
     // ---- Console ----

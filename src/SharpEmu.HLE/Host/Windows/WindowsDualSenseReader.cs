@@ -71,6 +71,23 @@ public static class WindowsDualSenseReader
         return state.Connected;
     }
 
+    // Battery snapshot parsed from the input report's status byte; consumed
+    // by launcher UI (the in-game overlay), not by the guest.
+    private static volatile bool _batteryKnown;
+    private static volatile int _batteryPercent;
+    private static volatile bool _batteryCharging;
+
+    /// <summary>
+    /// Last reported battery level (0-100) and charging state; false while
+    /// no DualSense is connected or no report carried battery data yet.
+    /// </summary>
+    public static bool TryGetBattery(out int percent, out bool charging)
+    {
+        percent = _batteryPercent;
+        charging = _batteryCharging;
+        return _batteryKnown;
+    }
+
     private static void SetState(in HostGamepadState state)
     {
         lock (Gate)
@@ -128,6 +145,7 @@ public static class WindowsDualSenseReader
 
     private static void OnDeviceLost()
     {
+        _batteryKnown = false;
         lock (Gate)
         {
             _devicePath = null;
@@ -412,6 +430,19 @@ public static class WindowsDualSenseReader
         buttons |= (buttons1 & 0x80) != 0 ? HostGamepadButtons.R3 : 0;
         buttons |= (buttons2 & 0x01) != 0 ? HostGamepadButtons.Home : 0;
         buttons |= (buttons2 & 0x02) != 0 ? HostGamepadButtons.TouchPad : 0;
+
+        // Battery status byte (same offset as hid-playstation's status
+        // field): low nibble is level in tenths, high nibble charge state.
+        if (report.Length > offset + 53)
+        {
+            var status = report[offset + 53];
+            var chargeState = (status >> 4) & 0x0F;
+            _batteryPercent = chargeState == 0x2
+                ? 100
+                : Math.Min(100, ((status & 0x0F) * 10) + 5);
+            _batteryCharging = chargeState == 0x1;
+            _batteryKnown = true;
+        }
 
         state = new HostGamepadState(
             Connected: true,

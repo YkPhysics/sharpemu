@@ -199,6 +199,60 @@ public static partial class WindowsXInputReader
         }
     }
 
+    /// <summary>
+    /// Coarse battery estimate for launcher UI. XInput only reports four
+    /// levels, mapped to representative percentages; wired pads read as
+    /// externally powered.
+    /// </summary>
+    public static bool TryGetBattery(out int percent, out bool charging)
+    {
+        percent = 0;
+        charging = false;
+        int slot;
+        lock (Gate)
+        {
+            slot = _slot;
+        }
+
+        if (slot < 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (XInputGetBatteryInformation((uint)slot, 0, out var info) != ErrorSuccess ||
+                info.BatteryType == 0)
+            {
+                return false;
+            }
+
+            if (info.BatteryType == 1) // BATTERY_TYPE_WIRED
+            {
+                percent = 100;
+                charging = true;
+                return true;
+            }
+
+            percent = info.BatteryLevel switch
+            {
+                0 => 5,
+                1 => 30,
+                2 => 65,
+                _ => 100,
+            };
+            return true;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+    }
+
     private static uint GetStateWithGuide(uint userIndex, out XInputState state)
     {
         if (_guideCapable)
@@ -300,6 +354,17 @@ public static partial class WindowsXInputReader
     // wButtons also carries the guide button (0x0400).
     [DllImport("xinput1_4.dll", EntryPoint = "#100")]
     private static extern uint XInputGetStateEx(uint userIndex, out XInputState state);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XInputBatteryInformation
+    {
+        public byte BatteryType;
+        public byte BatteryLevel;
+    }
+
+    [DllImport("xinput1_4.dll")]
+    private static extern uint XInputGetBatteryInformation(
+        uint userIndex, byte deviceType, out XInputBatteryInformation information);
 
     [LibraryImport("xinput1_4.dll")]
     private static partial uint XInputSetState(uint userIndex, ref XInputVibration vibration);
