@@ -28,6 +28,9 @@ public sealed class GameSurfaceHost : NativeControlHost
     private const uint WsClipSiblings = 0x04000000;
     private const uint WsClipChildren = 0x02000000;
     private const uint CsOwnDc = 0x0020;
+    private const int GwlExStyle = -20;
+    private const uint WsExLayered = 0x00080000;
+    private const uint LwaAlpha = 0x0002;
     private const uint WmSetCursor = 0x0020;
     private const uint WmMouseMove = 0x0200;
     private const int IdcArrow = 32512;
@@ -87,6 +90,42 @@ public sealed class GameSurfaceHost : NativeControlHost
     {
         _presentationVisible = visible;
         ApplyPresentationVisibility();
+    }
+
+    /// <summary>
+    /// Sets the child surface's composed opacity so the launcher can fade a
+    /// freshly presented game in instead of popping it over the library.
+    /// Uses a layered child window (Windows 8+); anything below 1.0 applies
+    /// the layered style with per-window alpha, and 1.0 removes the style
+    /// again so steady-state presentation skips the extra composition step.
+    /// Returns false where unsupported (non-Windows, or no window yet) so
+    /// callers can fall back to an instant reveal.
+    /// </summary>
+    public bool TrySetPresentationOpacity(double opacity)
+    {
+        if (!OperatingSystem.IsWindows() || _windowHandle == 0)
+        {
+            return false;
+        }
+
+        var exStyle = GetWindowLongW(_windowHandle, GwlExStyle);
+        if (opacity >= 1.0)
+        {
+            if ((exStyle & WsExLayered) != 0)
+            {
+                _ = SetWindowLongW(_windowHandle, GwlExStyle, exStyle & ~unchecked((int)WsExLayered));
+            }
+
+            return true;
+        }
+
+        if ((exStyle & WsExLayered) == 0)
+        {
+            _ = SetWindowLongW(_windowHandle, GwlExStyle, exStyle | unchecked((int)WsExLayered));
+        }
+
+        var alpha = (byte)Math.Clamp((int)Math.Round(opacity * 255), 0, 255);
+        return SetLayeredWindowAttributes(_windowHandle, 0, alpha, LwaAlpha);
     }
 
     /// <summary>
@@ -536,6 +575,16 @@ public sealed class GameSurfaceHost : NativeControlHost
 
     [DllImport("user32.dll", EntryPoint = "DefWindowProcW", CharSet = CharSet.Unicode)]
     private static extern nint DefWindowProcW(nint window, uint message, nint wParam, nint lParam);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    private static extern int GetWindowLongW(nint window, int index);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+    private static extern int SetWindowLongW(nint window, int index, int value);
+
+    [DllImport("user32.dll", EntryPoint = "SetLayeredWindowAttributes", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetLayeredWindowAttributes(nint window, uint colorKey, byte alpha, uint flags);
 
     [DllImport("user32.dll", EntryPoint = "SetCursor")]
     private static extern nint SetCursor(nint cursor);

@@ -36,6 +36,7 @@ public partial class MainWindow : Window
     private const int MaxConsoleLinesPerFlush = 500;
     private const double LaunchBlurRadius = 12;
     private const double BlurTransitionSeconds = 0.24;
+    private const double GameRevealSeconds = 0.45;
 
     private static readonly IBrush DefaultLineBrush = new SolidColorBrush(Color.Parse("#C7CFDE"));
     private static readonly IBrush DimLineBrush = new SolidColorBrush(Color.Parse("#6B7488"));
@@ -109,6 +110,10 @@ public partial class MainWindow : Window
 
     // Eases the tile strip toward keeping the selected tile centered.
     private readonly DispatcherTimer _stripScrollTimer;
+
+    // Fades the freshly presented game surface in over the blurred library.
+    private readonly DispatcherTimer _gameRevealTimer;
+    private long _gameRevealStartedAt;
 
     // Title-bar clock, console style.
     private readonly DispatcherTimer _clockTimer;
@@ -337,6 +342,12 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromMilliseconds(16),
         };
         _stripScrollTimer.Tick += (_, _) => AdvanceStripCentering();
+
+        _gameRevealTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(16),
+        };
+        _gameRevealTimer.Tick += (_, _) => AdvanceGameReveal();
 
         ClockText.Text = DateTime.Now.ToString("HH:mm");
         _clockTimer = new DispatcherTimer
@@ -1025,6 +1036,7 @@ public partial class MainWindow : Window
         _libraryBlurTimer.Stop();
         _gamepadTimer.Stop();
         _stripScrollTimer.Stop();
+        _gameRevealTimer.Stop();
         _clockTimer.Stop();
         _sndPreview.Stop();
         _discord?.Dispose();
@@ -2327,23 +2339,86 @@ public partial class MainWindow : Window
             if (_isRunning && !_isStopping)
             {
                 _awaitingFirstFrame = false;
-                ClearLibraryBlur();
                 MainContent.Margin = new Thickness(0);
                 RestoreGameViewToFull();
-                GameView.Background = Brushes.Black;
-                GameView.IsHitTestVisible = true;
-                _gameSurfaceHost?.SetPresentationVisible(true);
-                _gameSurfaceHost?.SetCursorAutoHide(true);
-                LibraryPage.IsVisible = false;
-                OptionsPage.IsVisible = false;
-                LibraryToolbar.IsVisible = false;
-                ContentToolbar.IsVisible = false;
-                ConsolePanel.IsVisible = false;
-                LaunchBar.IsVisible = false;
                 HideSessionLoading();
-                UpdateSessionBarVisibility();
+                BeginGameReveal();
             }
         });
+    }
+
+    /// <summary>
+    /// Eases the freshly presented game surface in over the blurred library
+    /// instead of popping it over the whole window. The blurred launcher
+    /// stays visible underneath while the native child's composed alpha
+    /// ramps up; the library chrome is dismantled only once the game is
+    /// fully opaque. Platforms without per-window alpha reveal instantly.
+    /// </summary>
+    private void BeginGameReveal()
+    {
+        var host = _gameSurfaceHost;
+        if (host is null)
+        {
+            return;
+        }
+
+        if (host.TrySetPresentationOpacity(0))
+        {
+            host.SetPresentationVisible(true);
+            host.SetCursorAutoHide(true);
+            _gameRevealStartedAt = Stopwatch.GetTimestamp();
+            _gameRevealTimer.Start();
+            return;
+        }
+
+        host.SetPresentationVisible(true);
+        host.SetCursorAutoHide(true);
+        CompleteGameReveal();
+    }
+
+    private void AdvanceGameReveal()
+    {
+        var host = _gameSurfaceHost;
+        if (host is null || !_isRunning || _isStopping)
+        {
+            // Session ended mid-fade; drop the layered style so the next
+            // launch does not inherit a transparent surface.
+            _gameRevealTimer.Stop();
+            _gameSurfaceHost?.TrySetPresentationOpacity(1);
+            return;
+        }
+
+        var elapsed = (Stopwatch.GetTimestamp() - _gameRevealStartedAt) /
+                      (double)Stopwatch.Frequency;
+        var progress = Math.Clamp(elapsed / GameRevealSeconds, 0, 1);
+        var easedProgress = 1 - Math.Pow(1 - progress, 3);
+        host.TrySetPresentationOpacity(easedProgress * 0.999);
+
+        if (progress >= 1)
+        {
+            _gameRevealTimer.Stop();
+            CompleteGameReveal();
+        }
+    }
+
+    private void CompleteGameReveal()
+    {
+        _gameSurfaceHost?.TrySetPresentationOpacity(1);
+        if (!_isRunning || _isStopping)
+        {
+            return;
+        }
+
+        ClearLibraryBlur();
+        GameView.Background = Brushes.Black;
+        GameView.IsHitTestVisible = true;
+        LibraryPage.IsVisible = false;
+        OptionsPage.IsVisible = false;
+        LibraryToolbar.IsVisible = false;
+        ContentToolbar.IsVisible = false;
+        ConsolePanel.IsVisible = false;
+        LaunchBar.IsVisible = false;
+        UpdateSessionBarVisibility();
     }
 
     private GameSurfaceHost EnsureGameSurfaceHost()
@@ -2434,6 +2509,8 @@ public partial class MainWindow : Window
             OnWindowFullScreen(this, new RoutedEventArgs());
         }
 
+        _gameRevealTimer.Stop();
+        _gameSurfaceHost?.TrySetPresentationOpacity(1);
         _gameSurfaceHost?.SetCursorAutoHide(false);
         _gameSurfaceHost?.SetPresentationVisible(false);
         _awaitingFirstFrame = false;
