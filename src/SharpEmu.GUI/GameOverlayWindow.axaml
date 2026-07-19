@@ -17,7 +17,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
         Background="Transparent"
         CanResize="False"
         ShowInTaskbar="False"
-        ShowActivated="False">
+        ShowActivated="False"
+        Topmost="True">
 
   <Panel x:Name="OverlayRoot">
 
