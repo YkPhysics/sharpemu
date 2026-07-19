@@ -32,6 +32,12 @@ public static partial class WindowsXInputReader
     private const ushort XinputB = 0x2000;
     private const ushort XinputX = 0x4000;
     private const ushort XinputY = 0x8000;
+    private const ushort XinputGuide = 0x0400; // XInputGetStateEx only
+
+    // The guide button is only reported by the undocumented XInputGetStateEx
+    // (ordinal 100); flips to false if the export is missing so the loop can
+    // fall back to the documented API.
+    private static bool _guideCapable = true;
 
     private static readonly object Gate = new();
     private static HostGamepadState _state;
@@ -164,7 +170,7 @@ public static partial class WindowsXInputReader
                 }
 
                 Console.Error.WriteLine("[LOADER][INFO] XInput (Xbox) controller connected.");
-                while (XInputGetState((uint)slot, out var state) == ErrorSuccess)
+                while (GetStateWithGuide((uint)slot, out var state) == ErrorSuccess)
                 {
                     SetState(Translate(state.Gamepad));
                     Thread.Sleep(8);
@@ -191,6 +197,23 @@ public static partial class WindowsXInputReader
         catch (EntryPointNotFoundException)
         {
         }
+    }
+
+    private static uint GetStateWithGuide(uint userIndex, out XInputState state)
+    {
+        if (_guideCapable)
+        {
+            try
+            {
+                return XInputGetStateEx(userIndex, out state);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _guideCapable = false;
+            }
+        }
+
+        return XInputGetState(userIndex, out state);
     }
 
     private static int FindConnectedSlot()
@@ -223,6 +246,7 @@ public static partial class WindowsXInputReader
         buttons |= (pad.Buttons & XinputB) != 0 ? HostGamepadButtons.Circle : 0;
         buttons |= (pad.Buttons & XinputX) != 0 ? HostGamepadButtons.Square : 0;
         buttons |= (pad.Buttons & XinputY) != 0 ? HostGamepadButtons.Triangle : 0;
+        buttons |= (pad.Buttons & XinputGuide) != 0 ? HostGamepadButtons.Home : 0;
         buttons |= pad.LeftTrigger > TriggerThreshold ? HostGamepadButtons.L2 : 0;
         buttons |= pad.RightTrigger > TriggerThreshold ? HostGamepadButtons.R2 : 0;
 
@@ -271,6 +295,11 @@ public static partial class WindowsXInputReader
     // xinput1_4.dll ships with Windows 8 and later.
     [LibraryImport("xinput1_4.dll")]
     private static partial uint XInputGetState(uint userIndex, out XInputState state);
+
+    // Undocumented ordinal-100 export; identical to XInputGetState except
+    // wButtons also carries the guide button (0x0400).
+    [DllImport("xinput1_4.dll", EntryPoint = "#100")]
+    private static extern uint XInputGetStateEx(uint userIndex, out XInputState state);
 
     [LibraryImport("xinput1_4.dll")]
     private static partial uint XInputSetState(uint userIndex, ref XInputVibration vibration);

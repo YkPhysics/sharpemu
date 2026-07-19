@@ -410,6 +410,7 @@ public static class WindowsDualSenseReader
         buttons |= (buttons1 & 0x20) != 0 ? HostGamepadButtons.Options : 0;
         buttons |= (buttons1 & 0x40) != 0 ? HostGamepadButtons.L3 : 0;
         buttons |= (buttons1 & 0x80) != 0 ? HostGamepadButtons.R3 : 0;
+        buttons |= (buttons2 & 0x01) != 0 ? HostGamepadButtons.Home : 0;
         buttons |= (buttons2 & 0x02) != 0 ? HostGamepadButtons.TouchPad : 0;
 
         state = new HostGamepadState(

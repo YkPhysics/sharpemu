@@ -637,6 +637,84 @@ SPDX-License-Identifier: GPL-2.0-or-later
       </Border>
     </primitives:Popup>
 
+    <!-- PS-button in-game overlay, control-center style. A native popup for
+         the same reason as the session bar: it must sit above the native
+         child game surface. Opened only while a game is presented; driven
+         by the gamepad (d-pad + Cross/Circle) and the mouse. -->
+    <primitives:Popup x:Name="GameOverlayPopup"
+                      IsOpen="False"
+                      PlacementTarget="{Binding #GameView}"
+                      Placement="Bottom"
+                      VerticalOffset="-262"
+                      Topmost="True"
+                      ShouldUseOverlayLayer="False"
+                      TakesFocusFromNativeControl="False"
+                      IsLightDismissEnabled="False">
+      <Border Classes="card" Width="620" CornerRadius="24" Padding="28,22">
+        <StackPanel Spacing="18">
+          <Grid ColumnDefinitions="*,Auto">
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+              <TextBlock x:Name="OverlayGameTitle" Text="Game" FontSize="17" FontWeight="Bold"
+                         MaxWidth="360" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+              <Border Classes="pill" VerticalAlignment="Center">
+                <TextBlock x:Name="OverlayElapsedText" Text="0m" FontSize="11"
+                           Foreground="{StaticResource MutedBrush}" />
+              </Border>
+            </StackPanel>
+            <TextBlock x:Name="OverlayClockText" Grid.Column="1" Text="00:00" FontSize="17"
+                       FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"
+                       VerticalAlignment="Center" />
+          </Grid>
+
+          <StackPanel Orientation="Horizontal" Spacing="24" HorizontalAlignment="Center">
+            <StackPanel Width="88" Spacing="8">
+              <Button x:Name="OverlayResumeButton" Classes="overlayIcon" HorizontalAlignment="Center">
+                <Path Data="M7,4.6 L15.8,10 L7,15.4 Z" />
+              </Button>
+              <TextBlock x:Name="OverlayResumeLabel" Text="Resume" FontSize="11" TextAlignment="Center" />
+            </StackPanel>
+            <StackPanel Width="88" Spacing="8">
+              <Button x:Name="OverlayFullscreenButton" Classes="overlayIcon" HorizontalAlignment="Center">
+                <Path Data="M4,8 V4 H8 M12,4 H16 V8 M16,12 V16 H12 M8,16 H4 V12" />
+              </Button>
+              <TextBlock x:Name="OverlayFullscreenLabel" Text="Fullscreen" FontSize="11" TextAlignment="Center" />
+            </StackPanel>
+            <StackPanel Width="88" Spacing="8">
+              <Button x:Name="OverlayConsoleButton" Classes="overlayIcon" HorizontalAlignment="Center">
+                <Path Data="M4.5,6.2 H15.5 M4.5,10 H15.5 M4.5,13.8 H15.5" />
+              </Button>
+              <TextBlock x:Name="OverlayConsoleLabel" Text="Console" FontSize="11" TextAlignment="Center" />
+            </StackPanel>
+            <StackPanel Width="88" Spacing="8">
+              <Button x:Name="OverlayQuitButton" Classes="overlayIcon" HorizontalAlignment="Center">
+                <Path Data="M10,3.5 V9.5 M6.2,5.6 a5.6,5.6 0 1 0 7.6,0" />
+              </Button>
+              <TextBlock x:Name="OverlayQuitLabel" Text="Close Game" FontSize="11" TextAlignment="Center" />
+            </StackPanel>
+          </StackPanel>
+
+          <StackPanel Orientation="Horizontal" Spacing="18" HorizontalAlignment="Center">
+            <StackPanel Orientation="Horizontal" Spacing="7">
+              <Border Classes="padHint">
+                <TextBlock Text="✕" FontSize="11" FontWeight="Bold"
+                           Foreground="{StaticResource MutedBrush}" />
+              </Border>
+              <TextBlock Text="Select" FontSize="11" Foreground="{StaticResource MutedBrush}"
+                         VerticalAlignment="Center" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="7">
+              <Border Classes="padHint">
+                <TextBlock Text="○" FontSize="11" FontWeight="Bold"
+                           Foreground="{StaticResource MutedBrush}" />
+              </Border>
+              <TextBlock Text="Close" FontSize="11" Foreground="{StaticResource MutedBrush}"
+                         VerticalAlignment="Center" />
+            </StackPanel>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </primitives:Popup>
+
     <!-- This is a native popup rather than an Avalonia overlay because the
          emulated Vulkan surface is a native child window. -->
     <!-- Anchored to MainContent, not GameView: the surface host is parked in

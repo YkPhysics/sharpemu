@@ -260,6 +260,36 @@ SPDX-License-Identifier: GPL-2.0-or-later
       <Setter Property="Stroke" Value="#11141B" />
     </Style>
 
+    <!-- In-game overlay action tiles: round icons with a focus ring driven
+         by gamepad navigation (the "focused" class) or the pointer. -->
+    <Style Selector="Button.overlayIcon">
+      <Setter Property="Background" Value="#26FFFFFF" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="2" />
+      <Setter Property="Width" Value="56" />
+      <Setter Property="Height" Value="56" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+    <Style Selector="Button.overlayIcon:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#40FFFFFF" />
+    </Style>
+    <Style Selector="Button.overlayIcon.focused">
+      <Setter Property="BorderBrush" Value="#E8ECF4" />
+      <Setter Property="Background" Value="#40FFFFFF" />
+    </Style>
+    <Style Selector="Button.overlayIcon Path">
+      <Setter Property="Stroke" Value="{StaticResource TextBrush}" />
+      <Setter Property="StrokeThickness" Value="1.7" />
+      <Setter Property="StrokeLineCap" Value="Round" />
+      <Setter Property="StrokeJoin" Value="Round" />
+      <Setter Property="Width" Value="20" />
+      <Setter Property="Height" Value="20" />
+      <Setter Property="Stretch" Value="None" />
+    </Style>
+
     <!-- Options category sidebar entries, console-settings style. -->
     <Style Selector="Button.sideItem">
       <Setter Property="Background" Value="Transparent" />

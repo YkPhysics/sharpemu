@@ -131,6 +131,14 @@ public partial class MainWindow : Window
     // Which backdrop layer is currently showing (see ShowBackdrop).
     private bool _backdropFrontIsA = true;
 
+    // PS-button in-game overlay state. The tiles array pairs each button
+    // with its label and action so gamepad navigation, hover, and clicks
+    // all share one selection model.
+    private bool _gameOverlayOpen;
+    private int _overlayTileIndex;
+    private (Button Button, TextBlock Label, Action Action)[] _overlayTiles = [];
+    private DateTime _sessionStartedAt;
+
     //Github http client for latest commit
     private static readonly HttpClient GithubHttpClient = CreateGithubHttpClient();
     private string? _latestCommitSha;
@@ -350,8 +358,52 @@ public partial class MainWindow : Window
         {
             Interval = TimeSpan.FromSeconds(1),
         };
-        _clockTimer.Tick += (_, _) => ClockText.Text = DateTime.Now.ToString("HH:mm");
+        _clockTimer.Tick += (_, _) =>
+        {
+            ClockText.Text = DateTime.Now.ToString("HH:mm");
+            if (_gameOverlayOpen)
+            {
+                UpdateOverlayStatus();
+            }
+        };
         _clockTimer.Start();
+
+        // PS-button overlay tiles: gamepad selection, hover, and clicks all
+        // funnel through the same tile list.
+        _overlayTiles =
+        [
+            (OverlayResumeButton, OverlayResumeLabel, CloseGameOverlay),
+            (OverlayFullscreenButton, OverlayFullscreenLabel, () =>
+            {
+                CloseGameOverlay();
+                OnWindowFullScreen(this, new RoutedEventArgs());
+            }),
+            (OverlayConsoleButton, OverlayConsoleLabel, () =>
+            {
+                CloseGameOverlay();
+                ShowConsoleWindow();
+            }),
+            (OverlayQuitButton, OverlayQuitLabel, () =>
+            {
+                CloseGameOverlay();
+                StopEmulator();
+            }),
+        ];
+        for (var tileIndex = 0; tileIndex < _overlayTiles.Length; tileIndex++)
+        {
+            var capturedIndex = tileIndex;
+            var tile = _overlayTiles[tileIndex];
+            tile.Button.Click += (_, _) => _overlayTiles[capturedIndex].Action();
+            tile.Button.PointerEntered += (_, _) =>
+            {
+                _overlayTileIndex = capturedIndex;
+                UpdateOverlaySelection();
+            };
+        }
+
+        // The overlay popup is topmost; never leave it floating over other
+        // applications when the launcher loses the foreground.
+        Deactivated += (_, _) => CloseGameOverlay();
 
 
         GithubButton.Click += (_, _) =>
@@ -558,7 +610,39 @@ public partial class MainWindow : Window
         {
             // The game renders inside the launcher window, so the launcher
             // stays active while playing. The controller belongs to the game
-            // then: no navigation, and Circle/B must never stop the session.
+            // then — except for the PS/guide button, which summons the
+            // in-game overlay, and overlay navigation while it is open.
+            var pressedInGame = pad.Buttons & ~_previousPadButtons;
+            if ((pressedInGame & HostGamepadButtons.Home) != 0)
+            {
+                ToggleGameOverlay();
+            }
+
+            if (_gameOverlayOpen)
+            {
+                if ((pressedInGame & HostGamepadButtons.Left) != 0 && _overlayTileIndex > 0)
+                {
+                    _overlayTileIndex--;
+                    UpdateOverlaySelection();
+                }
+
+                if ((pressedInGame & HostGamepadButtons.Right) != 0 &&
+                    _overlayTileIndex < _overlayTiles.Length - 1)
+                {
+                    _overlayTileIndex++;
+                    UpdateOverlaySelection();
+                }
+
+                if ((pressedInGame & HostGamepadButtons.Cross) != 0)
+                {
+                    _overlayTiles[_overlayTileIndex].Action();
+                }
+                else if ((pressedInGame & HostGamepadButtons.Circle) != 0)
+                {
+                    CloseGameOverlay();
+                }
+            }
+
             _previousPadButtons = pad.Buttons;
             return;
         }
@@ -2546,6 +2630,7 @@ public partial class MainWindow : Window
     {
         _isStopping = false;
         _awaitingFirstFrame = true;
+        _sessionStartedAt = DateTime.UtcNow;
         var host = EnsureGameSurfaceHost();
         ParkGameViewOffscreen();
         GameView.IsVisible = true;
@@ -2566,6 +2651,7 @@ public partial class MainWindow : Window
             OnWindowFullScreen(this, new RoutedEventArgs());
         }
 
+        CloseGameOverlay();
         _gameRevealCts?.Cancel();
         RevealScrim.IsVisible = false;
         _gameSurfaceHost?.TrySetPresentationOpacity(1);
@@ -2681,6 +2767,7 @@ public partial class MainWindow : Window
         // crash the GUI; parking it in the 1x1 corner lets the library
         // recover — and stay clickable — while the native closing popup
         // reports teardown progress.
+        CloseGameOverlay();
         _gameRevealCts?.Cancel();
         RevealScrim.IsVisible = false;
         _gameSurfaceHost?.TrySetPresentationOpacity(1);
@@ -2768,8 +2855,70 @@ public partial class MainWindow : Window
     private void UpdateSessionBarVisibility()
     {
         SessionBarPopup.IsOpen = _isRunning && !_isStopping && !_awaitingFirstFrame &&
-            !_gameRevealInProgress && GameView.IsVisible &&
+            !_gameRevealInProgress && !_gameOverlayOpen && GameView.IsVisible &&
             !_gameFullscreen && WindowState != WindowState.FullScreen;
+    }
+
+    // ---- PS-button in-game overlay ----
+
+    /// <summary>
+    /// Toggles the control-center overlay. Only available while a game is
+    /// actually presented: never in the library, during the loading
+    /// handshake, mid-reveal, or while the session is tearing down.
+    /// </summary>
+    private void ToggleGameOverlay()
+    {
+        if (_gameOverlayOpen)
+        {
+            CloseGameOverlay();
+            return;
+        }
+
+        if (!_isRunning || _isStopping || _awaitingFirstFrame || _gameRevealInProgress ||
+            !GameView.IsVisible)
+        {
+            return;
+        }
+
+        _gameOverlayOpen = true;
+        _overlayTileIndex = 0;
+        OverlayGameTitle.Text = SessionGameTitle.Text;
+        UpdateOverlayStatus();
+        UpdateOverlaySelection();
+        GameOverlayPopup.IsOpen = true;
+        UpdateSessionBarVisibility();
+    }
+
+    private void CloseGameOverlay()
+    {
+        if (!_gameOverlayOpen)
+        {
+            return;
+        }
+
+        _gameOverlayOpen = false;
+        GameOverlayPopup.IsOpen = false;
+        UpdateSessionBarVisibility();
+    }
+
+    private void UpdateOverlaySelection()
+    {
+        for (var tileIndex = 0; tileIndex < _overlayTiles.Length; tileIndex++)
+        {
+            var focused = tileIndex == _overlayTileIndex;
+            var tile = _overlayTiles[tileIndex];
+            tile.Button.Classes.Set("focused", focused);
+            tile.Label.Opacity = focused ? 1.0 : 0.55;
+        }
+    }
+
+    private void UpdateOverlayStatus()
+    {
+        OverlayClockText.Text = DateTime.Now.ToString("HH:mm");
+        var elapsed = DateTime.UtcNow - _sessionStartedAt;
+        OverlayElapsedText.Text = elapsed.TotalHours >= 1
+            ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes}m"
+            : $"{Math.Max(0, elapsed.Minutes)}m";
     }
 
     // ---- Console ----

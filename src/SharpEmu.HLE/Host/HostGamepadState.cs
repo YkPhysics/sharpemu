@@ -28,6 +28,11 @@ public enum HostGamepadButtons : uint
     R3 = 1 << 13,
     Options = 1 << 14,
     TouchPad = 1 << 15,
+
+    // PS / Xbox guide button. Never mapped into guest pad state (the pad
+    // exports translate flags explicitly); reserved for launcher UI, like
+    // the system button on a real console.
+    Home = 1 << 16,
 }
 
 /// <summary>
