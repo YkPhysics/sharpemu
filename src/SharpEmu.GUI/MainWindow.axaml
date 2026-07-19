@@ -645,7 +645,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
          Cross/Circle) and the mouse. -->
     <primitives:Popup x:Name="GameOverlayPopup"
                       IsOpen="False"
-                      PlacementTarget="{Binding #GameView}"
+                      PlacementTarget="{Binding #RootLayout}"
                       Placement="Center"
                       Topmost="True"
                       ShouldUseOverlayLayer="False"

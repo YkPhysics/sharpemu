@@ -412,6 +412,17 @@ public partial class MainWindow : Window
         // resumes the game, like pressing the PS button again.
         OverlayDimLayer.PointerPressed += (_, _) => CloseGameOverlay();
 
+        // Keep the sheet matched to the client area if the window resizes
+        // while the overlay is open (e.g. F11 from the keyboard).
+        RootLayout.SizeChanged += (_, _) =>
+        {
+            if (_gameOverlayOpen)
+            {
+                OverlayRoot.Width = RootLayout.Bounds.Width;
+                OverlayRoot.Height = RootLayout.Bounds.Height;
+            }
+        };
+
         // The overlay popup is topmost; never leave it floating over other
         // applications when the launcher loses the foreground.
         Deactivated += (_, _) => CloseGameOverlay();
@@ -2901,10 +2912,11 @@ public partial class MainWindow : Window
         UpdateOverlayStatus();
         UpdateOverlaySelection();
 
-        // The sheet fills the whole game view; the background fades while
-        // the bottom content rises, console style.
-        OverlayRoot.Width = GameView.Bounds.Width;
-        OverlayRoot.Height = GameView.Bounds.Height;
+        // The sheet fills the entire window client area (title and status
+        // bars included); the background fades while the bottom content
+        // rises, console style.
+        OverlayRoot.Width = RootLayout.Bounds.Width;
+        OverlayRoot.Height = RootLayout.Bounds.Height;
         GameOverlayPopup.IsOpen = true;
         AnimateSlideFadeIn(OverlayDimLayer, ref _overlayDimAnimationCts, 0);
         AnimateSlideFadeIn(OverlayTopBar, ref _overlayTopAnimationCts, 0);
