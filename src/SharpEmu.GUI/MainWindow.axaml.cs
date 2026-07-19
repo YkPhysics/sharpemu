@@ -135,6 +135,7 @@ public partial class MainWindow : Window
     // with its label and action so gamepad navigation, hover, and clicks
     // all share one selection model.
     private bool _gameOverlayOpen;
+    private GameOverlayWindow _overlayWindow = null!;
     private int _overlayTileIndex;
     private (Button Button, TextBlock Label, Border Ring, Action Action)[] _overlayTiles = [];
     private CancellationTokenSource? _overlaySheetAnimationCts;
@@ -373,24 +374,30 @@ public partial class MainWindow : Window
         };
         _clockTimer.Start();
 
-        // PS-button overlay tiles: gamepad selection, hover, and clicks all
-        // funnel through the same tile list.
+        // PS-button overlay: a borderless owned window (popups cannot cover
+        // the taskbar area). Tiles funnel gamepad selection, hover, and
+        // clicks through the same list.
+        _overlayWindow = new GameOverlayWindow();
         _overlayTiles =
         [
-            (OverlayResumeButton, OverlayResumeLabel, OverlayResumeRing, CloseGameOverlay),
-            (OverlayScreenshotButton, OverlayScreenshotLabel, OverlayScreenshotRing,
-                () => _ = CaptureGameScreenshotAsync()),
-            (OverlayFullscreenButton, OverlayFullscreenLabel, OverlayFullscreenRing, () =>
+            (_overlayWindow.OverlayResumeButton, _overlayWindow.OverlayResumeLabel,
+                _overlayWindow.OverlayResumeRing, CloseGameOverlay),
+            (_overlayWindow.OverlayScreenshotButton, _overlayWindow.OverlayScreenshotLabel,
+                _overlayWindow.OverlayScreenshotRing, () => _ = CaptureGameScreenshotAsync()),
+            (_overlayWindow.OverlayFullscreenButton, _overlayWindow.OverlayFullscreenLabel,
+                _overlayWindow.OverlayFullscreenRing, () =>
             {
                 CloseGameOverlay();
                 OnWindowFullScreen(this, new RoutedEventArgs());
             }),
-            (OverlayConsoleButton, OverlayConsoleLabel, OverlayConsoleRing, () =>
+            (_overlayWindow.OverlayConsoleButton, _overlayWindow.OverlayConsoleLabel,
+                _overlayWindow.OverlayConsoleRing, () =>
             {
                 CloseGameOverlay();
                 ShowConsoleWindow();
             }),
-            (OverlayQuitButton, OverlayQuitLabel, OverlayQuitRing, () =>
+            (_overlayWindow.OverlayQuitButton, _overlayWindow.OverlayQuitLabel,
+                _overlayWindow.OverlayQuitRing, () =>
             {
                 CloseGameOverlay();
                 StopEmulator();
@@ -410,22 +417,23 @@ public partial class MainWindow : Window
 
         // Clicking the sheet background (not a tile or the game card)
         // resumes the game, like pressing the PS button again.
-        OverlayDimLayer.PointerPressed += (_, _) => CloseGameOverlay();
+        _overlayWindow.OverlayDimLayer.PointerPressed += (_, _) => CloseGameOverlay();
 
-        // Keep the sheet matched to the client area if the window resizes
-        // while the overlay is open (e.g. F11 from the keyboard).
-        RootLayout.SizeChanged += (_, _) =>
+        // Keep the sheet matched to the window if it moves or resizes while
+        // the overlay is open (e.g. F11 from the keyboard).
+        RootLayout.SizeChanged += (_, _) => SyncOverlayWindowBounds();
+        PositionChanged += (_, _) => SyncOverlayWindowBounds();
+
+        // Close the overlay when the launcher loses the foreground — but a
+        // click on the overlay window itself activates it, so let the
+        // activation settle before deciding.
+        Deactivated += (_, _) => Dispatcher.UIThread.Post(() =>
         {
-            if (_gameOverlayOpen)
+            if (!IsActive && !_overlayWindow.IsActive)
             {
-                OverlayRoot.Width = RootLayout.Bounds.Width;
-                OverlayRoot.Height = RootLayout.Bounds.Height;
+                CloseGameOverlay();
             }
-        };
-
-        // The overlay popup is topmost; never leave it floating over other
-        // applications when the launcher loses the foreground.
-        Deactivated += (_, _) => CloseGameOverlay();
+        });
 
 
         GithubButton.Click += (_, _) =>
@@ -620,10 +628,11 @@ public partial class MainWindow : Window
 
         PadIndicator.IsVisible = true;
 
-        if (!IsActive)
+        if (!IsActive && !_overlayWindow.IsActive)
         {
             // Ignore input while the launcher is in the background, e.g. the
-            // game window is focused and using the same controller.
+            // game window is focused and using the same controller. The
+            // overlay window counts as "us": clicking it activates it.
             _previousPadButtons = pad.Buttons;
             return;
         }
@@ -1140,6 +1149,7 @@ public partial class MainWindow : Window
         _stripScrollTimer.Stop();
         _gameRevealCts?.Cancel();
         _clockTimer.Stop();
+        _overlayWindow.Close();
         _sndPreview.Stop();
         _discord?.Dispose();
         _consoleWindow?.Close();
@@ -2905,22 +2915,22 @@ public partial class MainWindow : Window
 
         _gameOverlayOpen = true;
         _overlayTileIndex = 0;
-        OverlayGameTitle.Text = _runningGameName ?? SessionGameTitle.Text;
-        OverlayTitleIdText.IsVisible = !string.IsNullOrWhiteSpace(_runningGameTitleId);
-        OverlayTitleIdText.Text = _runningGameTitleId ?? string.Empty;
+        _overlayWindow.OverlayGameTitle.Text = _runningGameName ?? SessionGameTitle.Text;
+        _overlayWindow.OverlayTitleIdText.IsVisible = !string.IsNullOrWhiteSpace(_runningGameTitleId);
+        _overlayWindow.OverlayTitleIdText.Text = _runningGameTitleId ?? string.Empty;
         UpdateOverlayCover();
         UpdateOverlayStatus();
         UpdateOverlaySelection();
 
-        // The sheet fills the entire window client area (title and status
-        // bars included); the background fades while the bottom content
-        // rises, console style.
-        OverlayRoot.Width = RootLayout.Bounds.Width;
-        OverlayRoot.Height = RootLayout.Bounds.Height;
-        GameOverlayPopup.IsOpen = true;
-        AnimateSlideFadeIn(OverlayDimLayer, ref _overlayDimAnimationCts, 0);
-        AnimateSlideFadeIn(OverlayTopBar, ref _overlayTopAnimationCts, 0);
-        AnimateSlideFadeIn(OverlaySheet, ref _overlaySheetAnimationCts, 30);
+        // The sheet window covers the entire client area (title and status
+        // bars included); shown without activation so the launcher keeps
+        // polling the pad. Background fades while the bottom content rises.
+        SyncOverlayWindowBounds();
+        _overlayWindow.Show(this);
+        SyncOverlayWindowBounds();
+        AnimateSlideFadeIn(_overlayWindow.OverlayDimLayer, ref _overlayDimAnimationCts, 0);
+        AnimateSlideFadeIn(_overlayWindow.OverlayTopBar, ref _overlayTopAnimationCts, 0);
+        AnimateSlideFadeIn(_overlayWindow.OverlaySheet, ref _overlaySheetAnimationCts, 30);
         UpdateSessionBarVisibility();
     }
 
@@ -2932,8 +2942,24 @@ public partial class MainWindow : Window
         }
 
         _gameOverlayOpen = false;
-        GameOverlayPopup.IsOpen = false;
+        _overlayWindow.Hide();
         UpdateSessionBarVisibility();
+    }
+
+    /// <summary>
+    /// Matches the overlay window to the launcher's client area, in screen
+    /// coordinates, so the sheet always covers exactly the window.
+    /// </summary>
+    private void SyncOverlayWindowBounds()
+    {
+        if (!_gameOverlayOpen)
+        {
+            return;
+        }
+
+        _overlayWindow.Position = this.PointToScreen(new Point(0, 0));
+        _overlayWindow.Width = RootLayout.Bounds.Width;
+        _overlayWindow.Height = RootLayout.Bounds.Height;
     }
 
     /// <summary>
@@ -2948,15 +2974,15 @@ public partial class MainWindow : Window
                 string.Equals(candidate.Path, ebootPath, FilePathComparison))
             : null;
         var cover = entry?.Cover;
-        OverlayCoverImage.Source = cover;
-        OverlayCoverImage.IsVisible = cover is not null;
-        OverlayCoverFallback.IsVisible = cover is null;
+        _overlayWindow.OverlayCoverImage.Source = cover;
+        _overlayWindow.OverlayCoverImage.IsVisible = cover is not null;
+        _overlayWindow.OverlayCoverFallback.IsVisible = cover is null;
         if (entry?.PlaceholderBrush is { } placeholder)
         {
-            OverlayCoverFallback.Background = placeholder;
+            _overlayWindow.OverlayCoverFallback.Background = placeholder;
         }
 
-        OverlayCoverInitials.Text = entry?.Initials ?? InitialsFor(_runningGameName);
+        _overlayWindow.OverlayCoverInitials.Text = entry?.Initials ?? InitialsFor(_runningGameName);
     }
 
     private static string InitialsFor(string? name)
@@ -2985,11 +3011,11 @@ public partial class MainWindow : Window
 
     private void UpdateOverlayStatus()
     {
-        OverlayClockText.Text = DateTime.Now.ToString("HH:mm");
+        _overlayWindow.OverlayClockText.Text = DateTime.Now.ToString("HH:mm");
 
         var elapsed = TimeSpan.FromSeconds(
             Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeSeconds() - _runningSinceUnixSeconds));
-        OverlayElapsedText.Text = elapsed.TotalHours >= 1
+        _overlayWindow.OverlayElapsedText.Text = elapsed.TotalHours >= 1
             ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes}m"
             : $"{elapsed.Minutes}m";
 
@@ -2998,13 +3024,13 @@ public partial class MainWindow : Window
         if (WindowsDualSenseReader.TryGetBattery(out var percent, out var charging) ||
             WindowsXInputReader.TryGetBattery(out percent, out charging))
         {
-            OverlayBatteryPanel.IsVisible = true;
-            OverlayBatteryText.Text = charging ? $"{percent}% ⚡" : $"{percent}%";
-            OverlayBatteryFill.Width = Math.Max(1, 14.0 * percent / 100);
+            _overlayWindow.OverlayBatteryPanel.IsVisible = true;
+            _overlayWindow.OverlayBatteryText.Text = charging ? $"{percent}% ⚡" : $"{percent}%";
+            _overlayWindow.OverlayBatteryFill.Width = Math.Max(1, 14.0 * percent / 100);
         }
         else
         {
-            OverlayBatteryPanel.IsVisible = false;
+            _overlayWindow.OverlayBatteryPanel.IsVisible = false;
         }
     }
 
