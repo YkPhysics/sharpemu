@@ -260,25 +260,41 @@ SPDX-License-Identifier: GPL-2.0-or-later
       <Setter Property="Stroke" Value="#11141B" />
     </Style>
 
-    <!-- In-game overlay action tiles: round icons with a focus ring driven
-         by gamepad navigation (the "focused" class) or the pointer. -->
+    <!-- In-game overlay action tiles, PS5 control-center style: frosted
+         circles that scale up slightly when focused, with a detached white
+         focus ring (a sibling Border) around the focused one. The "focused"
+         class is driven by gamepad navigation or the pointer. -->
     <Style Selector="Button.overlayIcon">
-      <Setter Property="Background" Value="#26FFFFFF" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="2" />
-      <Setter Property="Width" Value="56" />
-      <Setter Property="Height" Value="56" />
+      <Setter Property="Background" Value="#2EFFFFFF" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Width" Value="52" />
+      <Setter Property="Height" Value="52" />
       <Setter Property="Padding" Value="0" />
       <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="HorizontalAlignment" Value="Center" />
+      <Setter Property="VerticalAlignment" Value="Center" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="RenderTransform" Value="scale(1)" />
+      <Setter Property="Transitions">
+        <Transitions>
+          <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.12" />
+        </Transitions>
+      </Setter>
     </Style>
     <Style Selector="Button.overlayIcon:pointerover /template/ ContentPresenter#PART_ContentPresenter">
-      <Setter Property="Background" Value="#40FFFFFF" />
+      <Setter Property="Background" Value="#47FFFFFF" />
     </Style>
     <Style Selector="Button.overlayIcon.focused">
-      <Setter Property="BorderBrush" Value="#E8ECF4" />
-      <Setter Property="Background" Value="#40FFFFFF" />
+      <Setter Property="Background" Value="#47FFFFFF" />
+      <Setter Property="RenderTransform" Value="scale(1.06)" />
+    </Style>
+
+    <Style Selector="Border.overlayRing">
+      <Setter Property="BorderBrush" Value="#F2FFFFFF" />
+      <Setter Property="BorderThickness" Value="2" />
+      <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="IsVisible" Value="False" />
     </Style>
     <Style Selector="Button.overlayIcon Path">
       <Setter Property="Stroke" Value="{StaticResource TextBrush}" />

@@ -136,9 +136,10 @@ public partial class MainWindow : Window
     // all share one selection model.
     private bool _gameOverlayOpen;
     private int _overlayTileIndex;
-    private (Button Button, TextBlock Label, Action Action)[] _overlayTiles = [];
-    private CancellationTokenSource? _overlayCardAnimationCts;
+    private (Button Button, TextBlock Label, Border Ring, Action Action)[] _overlayTiles = [];
+    private CancellationTokenSource? _overlaySheetAnimationCts;
     private CancellationTokenSource? _overlayDimAnimationCts;
+    private CancellationTokenSource? _overlayTopAnimationCts;
     private string? _runningEbootPath;
     private bool _screenshotInProgress;
     private int _toastGeneration;
@@ -376,19 +377,20 @@ public partial class MainWindow : Window
         // funnel through the same tile list.
         _overlayTiles =
         [
-            (OverlayResumeButton, OverlayResumeLabel, CloseGameOverlay),
-            (OverlayScreenshotButton, OverlayScreenshotLabel, () => _ = CaptureGameScreenshotAsync()),
-            (OverlayFullscreenButton, OverlayFullscreenLabel, () =>
+            (OverlayResumeButton, OverlayResumeLabel, OverlayResumeRing, CloseGameOverlay),
+            (OverlayScreenshotButton, OverlayScreenshotLabel, OverlayScreenshotRing,
+                () => _ = CaptureGameScreenshotAsync()),
+            (OverlayFullscreenButton, OverlayFullscreenLabel, OverlayFullscreenRing, () =>
             {
                 CloseGameOverlay();
                 OnWindowFullScreen(this, new RoutedEventArgs());
             }),
-            (OverlayConsoleButton, OverlayConsoleLabel, () =>
+            (OverlayConsoleButton, OverlayConsoleLabel, OverlayConsoleRing, () =>
             {
                 CloseGameOverlay();
                 ShowConsoleWindow();
             }),
-            (OverlayQuitButton, OverlayQuitLabel, () =>
+            (OverlayQuitButton, OverlayQuitLabel, OverlayQuitRing, () =>
             {
                 CloseGameOverlay();
                 StopEmulator();
@@ -405,6 +407,10 @@ public partial class MainWindow : Window
                 UpdateOverlaySelection();
             };
         }
+
+        // Clicking the sheet background (not a tile or the game card)
+        // resumes the game, like pressing the PS button again.
+        OverlayDimLayer.PointerPressed += (_, _) => CloseGameOverlay();
 
         // The overlay popup is topmost; never leave it floating over other
         // applications when the launcher loses the foreground.
@@ -2889,20 +2895,20 @@ public partial class MainWindow : Window
         _gameOverlayOpen = true;
         _overlayTileIndex = 0;
         OverlayGameTitle.Text = _runningGameName ?? SessionGameTitle.Text;
-        OverlayTitleIdPill.IsVisible = !string.IsNullOrWhiteSpace(_runningGameTitleId);
+        OverlayTitleIdText.IsVisible = !string.IsNullOrWhiteSpace(_runningGameTitleId);
         OverlayTitleIdText.Text = _runningGameTitleId ?? string.Empty;
         UpdateOverlayCover();
         UpdateOverlayStatus();
         UpdateOverlaySelection();
 
-        // Dim layer first so the card's popup stacks above it; both are
-        // sized/laid out by their popups, the dim to the whole game view.
-        OverlayDimLayer.Width = GameView.Bounds.Width;
-        OverlayDimLayer.Height = GameView.Bounds.Height;
-        GameOverlayDimPopup.IsOpen = true;
+        // The sheet fills the whole game view; the background fades while
+        // the bottom content rises, console style.
+        OverlayRoot.Width = GameView.Bounds.Width;
+        OverlayRoot.Height = GameView.Bounds.Height;
         GameOverlayPopup.IsOpen = true;
         AnimateSlideFadeIn(OverlayDimLayer, ref _overlayDimAnimationCts, 0);
-        AnimateSlideFadeIn(OverlayCard, ref _overlayCardAnimationCts, 26);
+        AnimateSlideFadeIn(OverlayTopBar, ref _overlayTopAnimationCts, 0);
+        AnimateSlideFadeIn(OverlaySheet, ref _overlaySheetAnimationCts, 30);
         UpdateSessionBarVisibility();
     }
 
@@ -2915,7 +2921,6 @@ public partial class MainWindow : Window
 
         _gameOverlayOpen = false;
         GameOverlayPopup.IsOpen = false;
-        GameOverlayDimPopup.IsOpen = false;
         UpdateSessionBarVisibility();
     }
 
@@ -2960,7 +2965,8 @@ public partial class MainWindow : Window
             var focused = tileIndex == _overlayTileIndex;
             var tile = _overlayTiles[tileIndex];
             tile.Button.Classes.Set("focused", focused);
-            // PS5 style: only the focused tile shows its label.
+            tile.Ring.IsVisible = focused;
+            // PS5 style: only the focused tile shows its label (above it).
             tile.Label.Opacity = focused ? 1.0 : 0.0;
         }
     }
